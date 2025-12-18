@@ -23,17 +23,11 @@ sim2real/
 │       ├── launch/                 # ROS2 launch 파일
 │       └── scripts/                # 로봇 제어 스크립트
 │
-├── sim2real/                        # Sim2Real 브릿지 (공통)
-│   ├── policy_loader.py            # 학습된 정책 로드
-│   ├── robot_observation.py        # 로봇 상태 관측
-│   ├── sim2real_bridge.py          # Sim-Real 브릿지
-│   ├── pen_detector.py             # 펜 감지 (카메라)
-│   └── calibration_images/         # Hand-eye calibration 데이터
-│
-└── docs/                            # 문서
-    ├── INSTALL_GUIDE.md
-    ├── SIM2REAL_GUIDE.md
-    └── TRAINING_LOG.md
+└── sim2real/                        # Sim2Real 브릿지 (공통)
+    ├── policy_loader.py            # 학습된 정책 로드
+    ├── robot_observation.py        # 로봇 상태 관측
+    ├── sim2real_bridge.py          # Sim-Real 브릿지
+    └── pen_detector.py             # 펜 감지 (카메라)
 ```
 
 ## 의존성
@@ -74,10 +68,9 @@ python run_sim2real.py --checkpoint ../simulation/logs/pen_grasp/model_5000.pt
 
 ## 세부 가이드
 
-- [설치 가이드](docs/INSTALL_GUIDE.md)
-- [Sim2Real 가이드](docs/SIM2REAL_GUIDE.md)
 - [시뮬레이션 README](simulation/README.md)
 - [로봇 패키지 README](robot/e0509_gripper_description/README.md)
+- [Sim2Real 브릿지 README](sim2real/README.md)
 
 ## 하드웨어
 
