@@ -46,6 +46,10 @@ COMMAND_FILE = '/tmp/sim2real_command.json'
 # 목표 거리 (학습 환경과 동일)
 TARGET_DISTANCE = 0.05  # 5cm
 
+# 안전 장치 설정
+MAX_DETECTION_FAIL = 30  # 30회 연속 실패 시 Home 복귀 (1초 @ 30Hz)
+HOME_JOINT_DEG = [0.0, 0.0, 90.0, 0.0, 90.0, 0.0]
+
 
 class ActorNetwork(nn.Module):
     """RSL-RL Actor 네트워크"""
@@ -98,6 +102,10 @@ class PenTrackingController:
         # 상태
         self.prev_joint_pos = None
         self.action_scale = 0.05  # 학습 환경과 동일
+
+        # 안전 장치
+        self.detection_fail_count = 0
+        self.is_homing = False
 
     def _load_checkpoint(self, path: str):
         """체크포인트 로드"""
@@ -161,16 +169,17 @@ class PenTrackingController:
             joint_vel = (joint_pos - self.prev_joint_pos) * 30  # 30Hz 가정
         self.prev_joint_pos = joint_pos.copy()
 
-        # TCP 위치 (로봇 베이스 기준)
-        tcp_pos, _ = self.get_tcp_pose_from_state(robot_state)
+        # TCP 위치 및 회전 (로봇 베이스 기준)
+        tcp_pos, tcp_rot = self.get_tcp_pose_from_state(robot_state)
 
         # 상대 위치 (TCP → 펜)
         relative_pos = pen_pos_robot - tcp_pos
 
-        # 목표 오프셋 (현재 방향으로 5cm)
-        distance = np.linalg.norm(relative_pos) + 1e-6
-        direction = relative_pos / distance
-        target_offset = direction * TARGET_DISTANCE
+        # 그리퍼 Z축 방향 (회전 행렬의 3번째 열)
+        gripper_z = tcp_rot[:, 2]
+
+        # 목표 오프셋 (그리퍼 Z축 방향으로 5cm)
+        target_offset = gripper_z * TARGET_DISTANCE
 
         # Observation 구성 (18차원)
         obs = np.concatenate([
@@ -181,6 +190,21 @@ class PenTrackingController:
         ])
 
         return torch.tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
+
+    def send_home_command(self):
+        """Home 위치로 이동 명령"""
+        command = {
+            'type': 'move_joint',
+            'target_deg': HOME_JOINT_DEG,
+            'vel': 30.0,
+            'acc': 30.0,
+            'timestamp': time.time(),
+        }
+        try:
+            with open(COMMAND_FILE, 'w') as f:
+                json.dump(command, f)
+        except IOError as e:
+            print(f"[오류] Home 명령 전송 실패: {e}")
 
     def run_step(self) -> bool:
         """단일 제어 스텝 실행"""
@@ -193,8 +217,19 @@ class PenTrackingController:
         # 2. 펜 위치 감지 (카메라 좌표)
         pen_pos_cam = self.pen_detector.get_pen_position_camera()
         if pen_pos_cam is None:
-            print("[경고] 펜 감지 실패")
-            return True  # 계속 실행
+            self.detection_fail_count += 1
+
+            # 연속 실패 시 Home 복귀
+            if self.detection_fail_count >= MAX_DETECTION_FAIL:
+                if not self.is_homing:
+                    print(f"[안전] {MAX_DETECTION_FAIL}회 연속 펜 감지 실패 → Home 복귀")
+                    self.send_home_command()
+                    self.is_homing = True
+            return True  # 계속 실행 (명령 안 보냄)
+
+        # 펜 감지 성공 → 카운터 리셋
+        self.detection_fail_count = 0
+        self.is_homing = False
 
         # 3. 카메라 → 로봇 좌표 변환
         tcp_pos, tcp_rot = self.get_tcp_pose_from_state(robot_state)

@@ -73,9 +73,11 @@ python3 run_sim2real.py --checkpoint /path/to/model.pt --use_camera
 |------|------|-------------|
 | `sim2real_bridge.py` | ROS2 ↔ JSON 파일 브릿지 | 3.10 (ROS2) |
 | `run_sim2real.py` | Policy 추론 및 명령 생성 | 3.10/3.11 |
+| `run_pen_tracking.py` | 펜 추적 Sim2Real 실행 | 3.11 (Isaac) |
 | `policy_loader.py` | PyTorch 모델 로드 | 3.10/3.11 |
 | `pen_detector.py` | RealSense 펜 감지 | 3.10/3.11 |
 | `coordinate_transformer.py` | 카메라-로봇 좌표 변환 | 3.10/3.11 |
+| `test_ik_move.py` | IK 기반 TCP 이동 테스트 | 3.10 (ROS2) |
 
 ## 통신 파일 형식
 
@@ -100,6 +102,61 @@ python3 run_sim2real.py --checkpoint /path/to/model.pt --use_camera
   "timestamp": 1234567890.456
 }
 ```
+
+---
+
+## 펜 추적 (Pen Tracking)
+
+카메라로 펜을 인식하고 5cm 거리를 유지하며 따라가는 Sim2Real
+
+### 학습 (Isaac Lab)
+
+```bash
+cd ~/IsaacLab
+source /home/fhekwn549/isaacsim_env/bin/activate
+python pen_grasp_rl/scripts/train_pen_tracking.py --headless --num_envs 2048 --max_iterations 3000
+```
+
+### 시뮬레이션 테스트
+
+```bash
+python pen_grasp_rl/scripts/play_pen_tracking.py
+```
+
+### 실제 로봇 실행
+
+```bash
+# 터미널 1: 로봇 bringup
+source /opt/ros/humble/setup.bash
+source ~/doosan_ws/install/setup.bash
+ros2 launch e0509_gripper_description bringup.launch.py mode:=real host:=192.168.137.100
+
+# 터미널 2: Sim2Real 브릿지 (ROS2)
+source /opt/ros/humble/setup.bash
+source ~/doosan_ws/install/setup.bash
+cd ~/doosan_ws/src/e0509_gripper_description/scripts/sim2real
+python3 sim2real_bridge.py
+
+# 터미널 3: 펜 추적 실행 (Isaac Sim 환경)
+source /home/fhekwn549/isaacsim_env/bin/activate
+cd ~/doosan_ws/src/e0509_gripper_description/scripts/sim2real
+python3 run_pen_tracking.py
+```
+
+### 안전 장치
+
+- **펜 감지 실패 시**: 로봇 정지 (명령 전송 안 함)
+- **30회(1초) 연속 실패 시**: Home 위치로 자동 복귀
+- **펜 다시 감지 시**: 추적 재개
+
+### 의존성 (Isaac Sim 환경)
+
+```bash
+source /home/fhekwn549/isaacsim_env/bin/activate
+pip install pyrealsense2
+```
+
+---
 
 ## 트러블슈팅
 
