@@ -57,9 +57,20 @@ PRE_GRASP_TO_DESCEND_DOT = -0.95   # 정렬 조건 (약 18도 이내)
 SUCCESS_DIST = 0.02     # 2cm
 SUCCESS_DOT = -0.95     # dot < -0.95
 
-# 특이점 회피 설정 (라디안)
+# 특이점 회피 설정 (라디안) - 관절 한계로 자연 회피되므로 비활성화
 SINGULARITY_JOINT3_THRESHOLD = 0.15  # joint 3이 0 근처 (완전히 펴짐)
 SINGULARITY_JOINT5_THRESHOLD = 0.15  # joint 5가 0 근처 (손목 특이점)
+
+# 작업 공간 기반 관절 한계 (라디안) - IK 계산 결과 + 마진
+# 펜 위치: x(0.3~0.5), y(-0.2~0.2), z(0.2~0.5)
+WORKSPACE_JOINT_LIMITS_RAD = [
+    (-0.96, 0.96),    # joint_1: ±55° (base rotation)
+    (-1.31, 0.61),    # joint_2: -75° ~ 35° (shoulder)
+    (0.87, 2.88),     # joint_3: 50° ~ 165° (elbow - 특이점 0° 회피)
+    (-0.79, 0.79),    # joint_4: ±45° (wrist 1)
+    (1.05, 2.09),     # joint_5: 60° ~ 120° (wrist 2 - 특이점 0° 회피)
+    (-0.79, 0.79),    # joint_6: ±45° (wrist 3)
+]
 
 
 # =============================================================================
@@ -72,10 +83,13 @@ class E0509DirectEnvCfg(DirectRLEnvCfg):
     # 환경 기본 설정
     decimation = 2
     episode_length_s = 12.0
-    action_scale = 0.1
+    action_scale = 0.05   # 0.1 → 0.05 (과격한 움직임 방지)
     action_space = 6      # 6 DOF 팔
     observation_space = 27  # joint_pos(6) + joint_vel(6) + grasp_pos(3) + cap_pos(3) + rel_pos(3) + gripper_z(3) + pen_z(3)
     state_space = 0
+
+    # 작업 공간 기반 관절 한계 사용 여부
+    use_workspace_joint_limits = True
 
     # 시뮬레이션
     sim: SimulationCfg = SimulationCfg(
@@ -157,8 +171,8 @@ class E0509DirectEnvCfg(DirectRLEnvCfg):
     # 목표 위치 범위 (펜 리셋용)
     pen_pos_range = {
         "x": (0.3, 0.5),
-        "y": (-0.15, 0.15),
-        "z": (0.25, 0.35),
+        "y": (-0.20, 0.20),
+        "z": (0.20, 0.50),
     }
 
     # 펜 방향 랜덤화 범위 (라디안)
@@ -196,7 +210,7 @@ class E0509DirectEnvCfg(DirectRLEnvCfg):
     rew_scale_success = 100.0            # 성공 보상
     rew_scale_phase_transition = 15.0    # 단계 전환 보상
     rew_scale_action = -0.01             # 액션 페널티 (증가)
-    rew_scale_singularity = -1.0         # 특이점 페널티
+    rew_scale_singularity = 0.0          # 특이점 페널티 비활성화 (관절 한계로 자연 회피)
     rew_scale_wrong_direction = -2.0     # dot 양수(반대 방향) 페널티 (증가)
 
     # 지수적 정렬 보상 설정 (대폭 축소)
@@ -220,9 +234,17 @@ class E0509DirectEnv(DirectRLEnv):
         # 액션 스케일
         self.action_scale = self.cfg.action_scale
 
-        # 관절 한계
-        self.robot_dof_lower_limits = self.robot.data.soft_joint_pos_limits[0, :6, 0]
-        self.robot_dof_upper_limits = self.robot.data.soft_joint_pos_limits[0, :6, 1]
+        # 관절 한계 설정
+        if self.cfg.use_workspace_joint_limits:
+            # 작업 공간 기반 관절 한계 사용 (IK로 계산된 범위)
+            workspace_limits = torch.tensor(WORKSPACE_JOINT_LIMITS_RAD, device=self.device)
+            self.robot_dof_lower_limits = workspace_limits[:, 0]
+            self.robot_dof_upper_limits = workspace_limits[:, 1]
+            print("[E0509DirectEnv] 작업 공간 기반 관절 한계 적용됨")
+        else:
+            # 로봇 기본 관절 한계 사용
+            self.robot_dof_lower_limits = self.robot.data.soft_joint_pos_limits[0, :6, 0]
+            self.robot_dof_upper_limits = self.robot.data.soft_joint_pos_limits[0, :6, 1]
 
         # 상태 머신: 각 환경의 현재 단계 (2단계: PRE_GRASP, DESCEND)
         self.phase = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
