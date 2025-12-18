@@ -61,15 +61,16 @@ SUCCESS_DOT = -0.95     # dot < -0.95
 SINGULARITY_JOINT3_THRESHOLD = 0.15  # joint 3이 0 근처 (완전히 펴짐)
 SINGULARITY_JOINT5_THRESHOLD = 0.15  # joint 5가 0 근처 (손목 특이점)
 
-# 작업 공간 기반 관절 한계 (라디안) - IK 계산 결과 + 마진
+# 작업 공간 기반 관절 한계 (라디안) - V5: 더 넓은 범위
 # 펜 위치: x(0.3~0.5), y(-0.2~0.2), z(0.2~0.5)
+# 그리퍼가 아래를 향할 수 있도록 joint_5 범위 확장
 WORKSPACE_JOINT_LIMITS_RAD = [
-    (-0.96, 0.96),    # joint_1: ±55° (base rotation)
-    (-1.31, 0.61),    # joint_2: -75° ~ 35° (shoulder)
-    (0.87, 2.88),     # joint_3: 50° ~ 165° (elbow - 특이점 0° 회피)
-    (-0.79, 0.79),    # joint_4: ±45° (wrist 1)
-    (1.05, 2.09),     # joint_5: 60° ~ 120° (wrist 2 - 특이점 0° 회피)
-    (-0.79, 0.79),    # joint_6: ±45° (wrist 3)
+    (-1.57, 1.57),    # joint_1: ±90° (base rotation) - 확장
+    (-1.57, 0.79),    # joint_2: -90° ~ 45° (shoulder) - 확장
+    (0.52, 2.62),     # joint_3: 30° ~ 150° (elbow) - 확장
+    (-1.57, 1.57),    # joint_4: ±90° (wrist 1) - 확장
+    (0.52, 2.62),     # joint_5: 30° ~ 150° (wrist 2) - 그리퍼 아래 향하도록 확장
+    (-1.57, 1.57),    # joint_6: ±90° (wrist 3) - 확장
 ]
 
 
