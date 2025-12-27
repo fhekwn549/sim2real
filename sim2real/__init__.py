@@ -10,5 +10,7 @@ Components:
 """
 
 from .robot_observation import RobotObservationCollector
+from .action_processor import ActionProcessor
+from .jacobian_ik import JacobianIK
 
-__all__ = ['RobotObservationCollector']
+__all__ = ['RobotObservationCollector', 'ActionProcessor', 'JacobianIK']

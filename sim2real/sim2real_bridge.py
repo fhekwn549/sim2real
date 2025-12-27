@@ -25,6 +25,14 @@ from rclpy.node import Node
 from dsr_msgs2.srv import MoveJoint, GetCurrentPosj, GetCurrentPosx
 from std_srvs.srv import Trigger
 
+# 펜 위치 서비스 (CoWriteBot)
+try:
+    from cowritebot_interfaces.srv import GetPenPosition
+    PEN_SERVICE_AVAILABLE = True
+except ImportError:
+    PEN_SERVICE_AVAILABLE = False
+    print("[Warning] cowritebot_interfaces 없음. 펜 감지 비활성화.")
+
 # 공유 파일 경로
 STATE_FILE = '/tmp/sim2real_state.json'
 COMMAND_FILE = '/tmp/sim2real_command.json'
@@ -46,6 +54,16 @@ class Sim2RealBridge(Node):
         self.cli_get_posx = self.create_client(GetCurrentPosx, f'{prefix}/aux_control/get_current_posx')
         self.cli_gripper_open = self.create_client(Trigger, f'{prefix}/gripper/open')
         self.cli_gripper_close = self.create_client(Trigger, f'{prefix}/gripper/close')
+
+        # 펜 감지 서비스 (CoWriteBot find_marker)
+        self.cli_pen_position = None
+        self._pen_position = None  # 캐시된 펜 위치
+        self._pen_update_interval = 0.1  # 100ms
+        self._last_pen_update = 0
+
+        if PEN_SERVICE_AVAILABLE:
+            self.cli_pen_position = self.create_client(GetPenPosition, 'get_pen_position')
+            self.get_logger().info('펜 감지 서비스 활성화')
 
         # 상태
         self._last_command_time = 0
@@ -107,6 +125,39 @@ class Sim2RealBridge(Node):
             return pos, rot
         return [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]
 
+    def get_pen_position(self) -> dict:
+        """펜 위치 가져오기 (캐시 사용)"""
+        if self.cli_pen_position is None:
+            return None
+
+        # 업데이트 간격 체크
+        now = time.time()
+        if now - self._last_pen_update < self._pen_update_interval:
+            return self._pen_position
+
+        # 서비스 호출
+        if not self.cli_pen_position.service_is_ready():
+            return self._pen_position
+
+        try:
+            req = GetPenPosition.Request()
+            result = self._call_service(self.cli_pen_position, req, timeout=0.5)
+
+            if result and result.success:
+                # mm → m 변환
+                self._pen_position = {
+                    'cap_end_3d': [x / 1000.0 for x in result.cap_end_3d],
+                    'tip_end_3d': [x / 1000.0 for x in result.tip_end_3d],
+                    'center': list(result.center),
+                    'angle': result.angle,
+                    'detected': True,
+                }
+                self._last_pen_update = now
+        except Exception as e:
+            self.get_logger().warn(f'펜 감지 실패: {e}')
+
+        return self._pen_position
+
     def write_state(self):
         """로봇 상태를 파일에 저장"""
         joint_pos_deg = self.get_joint_positions_deg()
@@ -121,6 +172,11 @@ class Sim2RealBridge(Node):
             'tcp_rot_deg': tcp_rot_deg,
             'tcp_rot_rad': [np.radians(d) for d in tcp_rot_deg],
         }
+
+        # 펜 위치 추가
+        pen_info = self.get_pen_position()
+        if pen_info:
+            state['pen'] = pen_info
 
         try:
             with open(STATE_FILE, 'w') as f:
