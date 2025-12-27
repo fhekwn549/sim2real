@@ -53,5 +53,23 @@
 
 ## Deprecated 파일 목록
 
+### 아키텍처 관련
 - `sim2real_bridge.py`: ROS2 ↔ JSON 파일 브릿지 (더 이상 사용 안 함)
 - `robot_observation.py`: 이전 observation 구성 방식 (run_sim2real.py에 통합됨)
+
+### 캘리브레이션 관련
+- `auto_hand_eye_calibration.py`: 자동 hand-eye 캘리브레이션 (calibrate_eye_to_hand.py로 대체)
+- `hand_eye_calibration.py`: 이전 캘리브레이션 방식
+- `manual_hand_eye_calibration.py`: 수동 캘리브레이션
+- `verify_calibration.py`: 캘리브레이션 검증 (test_pen_detection_calibrated.py로 대체)
+- `generate_checkerboard.py`: 체커보드 생성 (ArUco 마커 사용으로 불필요)
+
+### 펜 감지/제어 관련
+- `pen_detector.py`: HSV 기반 펜 감지 (pen_detector_yolo.py로 대체)
+- `pen_grasp_controller.py`: 이전 펜 잡기 컨트롤러 (run_sim2real.py로 통합)
+- `run_pen_tracking.py`: 이전 tracking 스크립트 (run_sim2real.py로 대체)
+- `action_processor.py`: 이전 action 처리 방식 (run_sim2real.py로 통합)
+
+### 테스트 관련
+- `test_ik_move.py`: IK 이동 테스트 (jacobian_ik.py에서 직접 테스트)
+- `test_observation.py`: observation 테스트 (run_sim2real.py에서 직접 확인)
