@@ -269,8 +269,8 @@ if __name__ == "__main__":
     # 체크포인트가 있으면 테스트
     import os
     test_paths = [
-        "/home/fhekwn549/IsaacLab/final_model",
-        "/home/fhekwn549/IsaacLab/logs/e0509_reach",
+        os.path.join(os.path.expanduser("~"), "IsaacLab/final_model"),
+        os.path.join(os.path.expanduser("~"), "IsaacLab/logs/e0509_reach"),
     ]
 
     for path in test_paths:

@@ -29,7 +29,9 @@ from typing import Tuple, Optional
 from scipy.spatial.transform import Rotation as R
 
 
-CALIBRATION_FILE = "/home/fhekwn549/doosan_ws/src/e0509_gripper_description/scripts/sim2real/calibration_result.npz"
+# 캘리브레이션 파일 경로 (스크립트 위치 기준 상대 경로)
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+CALIBRATION_FILE = os.path.join(_SCRIPT_DIR, "config", "calibration_eye_to_hand.npz")
 
 
 class CoordinateTransformer:

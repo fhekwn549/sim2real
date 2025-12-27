@@ -37,7 +37,7 @@ class CalibratedPenDetector:
 
         # YOLO 모델 경로
         if model_path is None:
-            model_path = "/home/fhekwn549/runs/segment/train/weights/best.pt"
+            model_path = os.path.join(os.path.expanduser("~"), "runs/segment/train/weights/best.pt")
 
         # 펜 감지기 (YOLO 세그멘테이션)
         self.detector = YOLOPenDetector(model_path)

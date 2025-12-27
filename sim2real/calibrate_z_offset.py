@@ -35,7 +35,7 @@ class ZOffsetCalibrator:
         self.script_dir = os.path.dirname(os.path.abspath(__file__))
 
         # YOLO 펜 감지기
-        model_path = "/home/fhekwn549/runs/segment/train/weights/best.pt"
+        model_path = os.path.join(os.path.expanduser("~"), "runs/segment/train/weights/best.pt")
         self.detector = YOLOPenDetector(model_path)
 
         # 캘리브레이션 로드

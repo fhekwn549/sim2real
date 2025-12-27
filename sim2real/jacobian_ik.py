@@ -35,7 +35,8 @@ except ImportError:
 # =============================================================================
 # URDF 경로
 # =============================================================================
-DEFAULT_URDF_PATH = "/home/fhekwn549/doosan_ws/src/doosan-robot2/dsr_description2/urdf/e0509.urdf"
+import os
+DEFAULT_URDF_PATH = os.path.join(os.path.expanduser("~"), "doosan_ws/src/doosan-robot2/dsr_description2/urdf/e0509.urdf")
 
 
 # =============================================================================

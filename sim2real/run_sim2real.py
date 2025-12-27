@@ -95,7 +95,7 @@ class Sim2RealConfig:
     scale_range_cm: float = 10.0 # 10cm에서 scale=1.0
 
     # YOLO
-    yolo_model_path: str = "/home/fhekwn549/runs/segment/train/weights/best.pt"
+    yolo_model_path: str = os.path.join(os.path.expanduser("~"), "runs/segment/train/weights/best.pt")
 
 
 # =============================================================================
@@ -961,7 +961,9 @@ class Sim2RealV7:
                     if not policy_running and pen_result is not None:
                         # 스크린샷 자동 저장
                         timestamp = time.strftime("%Y%m%d_%H%M%S")
-                        screenshot_path = f"/home/fhekwn549/Pictures/스크린샷/sim2real_start_{timestamp}.png"
+                        screenshot_dir = os.path.join(os.path.expanduser("~"), "Pictures/스크린샷")
+                        os.makedirs(screenshot_dir, exist_ok=True)
+                        screenshot_path = os.path.join(screenshot_dir, f"sim2real_start_{timestamp}.png")
                         cv2.imwrite(screenshot_path, display)
                         print(f"\n[Screenshot] 저장: {screenshot_path}")
 
@@ -1070,12 +1072,12 @@ class Sim2RealV7:
 def main():
     parser = argparse.ArgumentParser(description="Sim2Real V7")
     parser.add_argument("--checkpoint", type=str,
-                       default="/home/fhekwn549/ikv7/model_99999.pt",
+                       default=os.path.join(os.path.expanduser("~"), "ikv7/model_99999.pt"),
                        help="학습된 모델 경로 (.pt)")
     parser.add_argument("--calibration", type=str, default=None,
                        help="캘리브레이션 파일 경로")
     parser.add_argument("--yolo_model", type=str,
-                       default="/home/fhekwn549/runs/segment/train/weights/best.pt",
+                       default=os.path.join(os.path.expanduser("~"), "runs/segment/train/weights/best.pt"),
                        help="YOLO 모델 경로")
     parser.add_argument("--duration", type=float, default=60.0,
                        help="최대 실행 시간 (초)")
