@@ -46,6 +46,58 @@ sim2real/
 - YOLOv8 Segmentation
 - Intel RealSense SDK
 
+## 설치
+
+### 1. 로봇 패키지 설치 (ROS2 워크스페이스)
+```bash
+mkdir -p ~/doosan_ws/src
+cd ~/doosan_ws/src
+
+# Doosan 드라이버 (포크 버전 - Flange Serial 지원)
+git clone -b humble https://github.com/fhekwn549/doosan-robot2.git
+
+# 그리퍼 패키지
+git clone https://github.com/ROBOTIS-GIT/RH-P12-RN-A.git
+
+# 로봇 description 패키지
+git clone https://github.com/fhekwn549/e0509_gripper_description.git
+
+# 빌드
+cd ~/doosan_ws
+rosdep install --from-paths src --ignore-src -r -y
+colcon build --symlink-install
+source install/setup.bash
+```
+
+### 2. Sim2Real 레포 클론
+```bash
+cd ~
+git clone https://github.com/fhekwn549/sim2real.git
+```
+
+### 3. Python 의존성 설치
+```bash
+cd ~/sim2real
+pip install torch numpy scipy roboticstoolbox-python ultralytics pyrealsense2 opencv-python
+```
+
+### 4. (선택) 강화학습 환경 설치
+시뮬레이션 학습을 하려면 CoWriteBotRL도 클론:
+```bash
+cd ~
+git clone https://github.com/KERNEL3-2/CoWriteBotRL.git
+```
+
+### 5. 환경 설정 (~/.bashrc)
+```bash
+# ROS2
+source /opt/ros/humble/setup.bash
+source ~/doosan_ws/install/setup.bash
+
+# Python 경로 (sim2real 모듈 import용)
+export PYTHONPATH=$PYTHONPATH:~/sim2real
+```
+
 ## 빠른 시작
 
 ### 1. 시뮬레이션 학습 (CoWriteBotRL)
