@@ -104,22 +104,22 @@ export PYTHONPATH=$PYTHONPATH:~/sim2real
 ```bash
 source ~/isaacsim_env/bin/activate
 cd ~/CoWriteBotRL
-python pen_grasp_rl/scripts/train_v7.py --headless --num_envs 4096 --max_iterations 100000
+python pen_grasp_rl/scripts/train_v7.py --headless --num_envs <num_envs> --max_iterations <num_iter>
 ```
 
 ### 2. 학습된 정책 테스트 (시뮬레이션)
 ```bash
-python pen_grasp_rl/scripts/play_v7.py --checkpoint ~/ikv7/model_99999.pt
+python pen_grasp_rl/scripts/play_v7.py --checkpoint <model_path>
 ```
 
 ### 3. 실제 로봇 실행
 ```bash
 # 터미널 1: 로봇 bringup
-ros2 launch e0509_gripper_description bringup.launch.py mode:=real host:=192.168.137.100
+ros2 launch e0509_gripper_description bringup.launch.py mode:=real host:=<robot_ip>
 
 # 터미널 2: Sim2Real 실행
 cd ~/sim2real/sim2real
-python run_sim2real.py --checkpoint ~/ikv7/model_99999.pt
+python run_sim2real.py --checkpoint <model_path>
 ```
 
 
