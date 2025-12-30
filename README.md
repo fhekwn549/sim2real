@@ -18,14 +18,22 @@ Isaac Lab 기반 강화학습으로 로봇이 펜을 적절한 자세로 잡는 
 ```
 sim2real/
 └── sim2real/                        # Sim2Real 실행 코드
-    ├── run_sim2real.py              # 메인 실행 스크립트
+    ├── run_sim2real.py              # 메인 실행 스크립트 (IK 모드)
+    ├── run_sim2real_unified.py      # 통합 스크립트 (IK/OSC 모드)
     ├── jacobian_ik.py               # Differential IK (DLS 방식)
+    ├── osc_controller.py            # OSC 토크 컨트롤러
     ├── pen_detector_yolo.py         # YOLO 펜 감지
-    ├── coordinate_transformer.py    # 카메라 → 로봇 좌표 변환
-    ├── robot_interface.py           # 로봇 인터페이스 (ROS2)
+    ├── robot_interface.py           # 로봇 인터페이스 (ROS2, 토크 제어 포함)
     ├── gripper_interface.py         # 그리퍼 인터페이스
     ├── policy_loader.py             # 학습된 정책 로드
+    ├── calibration/                 # 캘리브레이션 스크립트
+    │   ├── calibrate_eye_to_hand.py # Eye-to-Hand 캘리브레이션
+    │   ├── calibrate_z_offset.py    # Z 오프셋 캘리브레이션
+    │   ├── coordinate_transformer.py# 카메라 → 로봇 좌표 변환
+    │   └── collect_yolo_data.py     # YOLO 학습 데이터 수집
     ├── config/                      # 캘리브레이션 설정
+    ├── test_osc_control.py          # OSC 제어 테스트
+    ├── test_torque_control.py       # 토크 제어 테스트
     ├── SIM2REAL_GUIDE.md            # 상세 가이드
     └── deprecated/                  # 이전 버전 파일들
 ```

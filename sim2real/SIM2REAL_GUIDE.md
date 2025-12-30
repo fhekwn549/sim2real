@@ -55,7 +55,7 @@ Doosan E0509 로봇 + RH-P12-RN-A 그리퍼를 사용한 펜 잡기 강화학습
 
 #### 실행
 ```bash
-cd ~/doosan_ws/src/e0509_sim2real/scripts
+cd ~/sim2real/sim2real/calibration
 python3 calibrate_eye_to_hand.py
 ```
 
@@ -65,7 +65,7 @@ python3 calibrate_eye_to_hand.py
 - `q`: 종료
 
 #### 결과 파일
-- `scripts/config/calibration_eye_to_hand.npz`
+- `sim2real/config/calibration_eye_to_hand.npz`
   - `R_axes`: 회전 행렬 (3x3)
   - `t_offset`: 이동 벡터 (3)
   - `T_cam_to_base`: 변환 행렬 (4x4)
@@ -100,6 +100,7 @@ np.savez(path, **data)
 
 ### 3.1 데이터 수집
 ```bash
+cd ~/sim2real/sim2real/calibration
 python3 collect_yolo_data.py
 ```
 - `s`: 이미지 저장
@@ -128,8 +129,14 @@ yolo segment train data=pen_dataset model=yolov8n-seg.pt epochs=100 imgsz=640
 
 ### 4.2 실행
 ```bash
-cd ~/doosan_ws/src/e0509_sim2real/scripts
+cd ~/sim2real/sim2real
+
+# IK 모드 (위치 제어) - 기존 방식
 python3 run_sim2real.py --checkpoint /path/to/model.pt
+
+# 또는 통합 스크립트 사용 (IK/OSC 선택 가능)
+python3 run_sim2real_unified.py --checkpoint /path/to/model.pt --mode ik   # IK 모드
+python3 run_sim2real_unified.py --checkpoint /path/to/model.pt --mode osc  # OSC 모드 (토크 제어)
 ```
 
 ### 4.3 조작
@@ -204,20 +211,30 @@ python3 run_sim2real.py --checkpoint /path/to/model.pt
 ## 7. 파일 구조
 
 ```
-e0509_sim2real/
-├── config/
-│   ├── config.yaml              # 설정 파일
-│   └── calibration_eye_to_hand.npz  # 캘리브레이션 결과
-├── scripts/
-│   ├── run_sim2real.py          # 메인 실행 스크립트
-│   ├── jacobian_ik.py           # Differential IK
-│   ├── pen_detector_yolo.py     # YOLO 펜 감지
-│   ├── coordinate_transformer.py # 좌표 변환
-│   ├── robot_interface.py       # 로봇 인터페이스
-│   ├── policy_loader.py         # Policy 로더
-│   ├── calibrate_eye_to_hand.py # 캘리브레이션
-│   └── test_pen_detection_calibrated.py  # 감지 테스트
-└── SIM2REAL_GUIDE.md            # 이 문서
+sim2real/
+├── sim2real/
+│   ├── run_sim2real.py              # 메인 실행 스크립트 (IK 모드)
+│   ├── run_sim2real_unified.py      # 통합 스크립트 (IK/OSC 모드)
+│   ├── jacobian_ik.py               # Differential IK
+│   ├── osc_controller.py            # OSC 토크 컨트롤러
+│   ├── pen_detector_yolo.py         # YOLO 펜 감지
+│   ├── robot_interface.py           # 로봇 인터페이스 (토크 제어 포함)
+│   ├── gripper_interface.py         # 그리퍼 인터페이스
+│   ├── policy_loader.py             # Policy 로더
+│   ├── calibration/                 # 캘리브레이션 스크립트
+│   │   ├── calibrate_eye_to_hand.py # Eye-to-Hand 캘리브레이션
+│   │   ├── calibrate_z_offset.py    # Z 오프셋 캘리브레이션
+│   │   ├── coordinate_transformer.py# 좌표 변환
+│   │   └── collect_yolo_data.py     # YOLO 데이터 수집
+│   ├── config/
+│   │   ├── config.yaml              # 설정 파일
+│   │   └── calibration_eye_to_hand.npz  # 캘리브레이션 결과
+│   ├── test_osc_control.py          # OSC 제어 테스트
+│   ├── test_torque_control.py       # 토크 제어 테스트
+│   ├── test_pen_detection_calibrated.py  # 펜 감지 테스트
+│   ├── deprecated/                  # 이전 버전 파일들
+│   └── SIM2REAL_GUIDE.md            # 이 문서
+└── README.md
 ```
 
 ---
