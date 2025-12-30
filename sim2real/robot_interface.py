@@ -15,15 +15,24 @@ Usage:
     joint_pos = robot.get_joint_positions()  # 라디안
     tcp_pos, tcp_rot = robot.get_tcp_pose()
 
-    # 이동 명령
+    # 이동 명령 (위치 제어)
     robot.move_joint(target_rad, vel=30, acc=30)
     robot.move_linear(target_pos, target_rot, vel=100, acc=100)
+
+    # 토크 제어 (실시간 제어)
+    robot.start_rt_control()
+    while running:
+        state = robot.read_rt_state()
+        torque = compute_torque(state)
+        robot.set_torque(torque)
+    robot.stop_rt_control()
 """
 
 import numpy as np
 import time
 import math
 from typing import Tuple, Optional, List
+from dataclasses import dataclass, field
 
 # DRFL import 시도
 try:
@@ -44,6 +53,38 @@ try:
 except ImportError:
     ROS2_AVAILABLE = False
     print("[Warning] ROS2 not found.")
+
+
+@dataclass
+class RobotStateRt:
+    """실시간 로봇 상태 데이터 (OSC 제어용)
+
+    Doosan ReadDataRt 서비스의 응답을 파이썬 객체로 변환한 것.
+    모든 각도는 라디안, 위치는 미터 단위로 변환됨.
+    """
+    # 타임스탬프
+    time_stamp: float = 0.0
+
+    # 관절 상태 (라디안, 라디안/초)
+    joint_position: np.ndarray = field(default_factory=lambda: np.zeros(6))
+    joint_velocity: np.ndarray = field(default_factory=lambda: np.zeros(6))
+
+    # TCP 상태 (미터, 라디안)
+    tcp_position: np.ndarray = field(default_factory=lambda: np.zeros(6))  # [x,y,z,a,b,c]
+    tcp_velocity: np.ndarray = field(default_factory=lambda: np.zeros(6))
+
+    # 토크 정보 (Nm)
+    gravity_torque: np.ndarray = field(default_factory=lambda: np.zeros(6))
+    actual_joint_torque: np.ndarray = field(default_factory=lambda: np.zeros(6))
+    external_joint_torque: np.ndarray = field(default_factory=lambda: np.zeros(6))
+
+    # 동역학 행렬 (OSC용)
+    mass_matrix: np.ndarray = field(default_factory=lambda: np.zeros((6, 6)))
+    coriolis_matrix: np.ndarray = field(default_factory=lambda: np.zeros((6, 6)))
+    jacobian_matrix: np.ndarray = field(default_factory=lambda: np.zeros((6, 6)))
+
+    # 제어 모드 (0: position, 1: torque)
+    control_mode: int = 0
 
 
 class DoosanRobot:
@@ -89,6 +130,12 @@ class DoosanRobot:
         self._ros2_thread = None
         self._ros2_joint_pos = None
         self._ros2_tcp_pos = None  # [x, y, z, rx, ry, rz]
+
+        # 실시간 제어 관련
+        self._rt_connected = False
+        self._rt_started = False
+        self._rt_state = RobotStateRt()
+        self._torque_publisher = None
 
         if self.use_ros2:
             print(f"[Robot] ROS2 mode, namespace: /{ros2_namespace}")
@@ -542,6 +589,339 @@ class DoosanRobot:
     def clamp_joint_positions(self, joint_pos: np.ndarray) -> np.ndarray:
         """관절 한계 내로 클램핑"""
         return np.clip(joint_pos, self.joint_limits_lower, self.joint_limits_upper)
+
+    # =========================================================================
+    # 실시간 토크 제어 (ROS2 전용)
+    # =========================================================================
+
+    def start_rt_control(self) -> bool:
+        """
+        실시간 제어 모드 시작
+
+        실시간 제어가 시작되면 로봇은 토크 명령을 기다립니다.
+        반드시 주기적으로 (1kHz 권장) set_torque()를 호출해야 합니다.
+
+        Returns:
+            성공 여부
+        """
+        if not self.use_ros2:
+            print("[RT] 실시간 제어는 ROS2 모드에서만 지원됩니다.")
+            return False
+
+        if self._rt_started:
+            print("[RT] 이미 실시간 제어가 시작되었습니다.")
+            return True
+
+        try:
+            import subprocess
+
+            # 1. 실시간 제어 연결 (이미 연결되어 있을 수 있음)
+            if not self._rt_connected:
+                print("[RT] 실시간 제어 연결 중...")
+                cmd = (
+                    f"source /opt/ros/humble/setup.bash && "
+                    f"source ~/doosan_ws/install/setup.bash && "
+                    f"ros2 service call /{self.ros2_namespace}/realtime/connect_rt_control "
+                    f"dsr_msgs2/srv/ConnectRtControl '{{ip_address: \"{self.ip}\", port: 12347}}'"
+                )
+                result = subprocess.run(['bash', '-c', cmd], capture_output=True, text=True, timeout=10)
+                if 'success: true' in result.stdout.lower() or 'success=true' in result.stdout.lower():
+                    self._rt_connected = True
+                    print("[RT] 실시간 제어 연결 성공")
+                else:
+                    # 이미 연결되어 있을 수 있음
+                    print("[RT] 실시간 제어 연결 (이미 연결됨)")
+                    self._rt_connected = True
+
+            # 2. 실시간 제어 시작
+            print("[RT] 실시간 제어 시작 중...")
+            cmd = (
+                f"source /opt/ros/humble/setup.bash && "
+                f"source ~/doosan_ws/install/setup.bash && "
+                f"ros2 service call /{self.ros2_namespace}/realtime/start_rt_control "
+                f"dsr_msgs2/srv/StartRtControl"
+            )
+            result = subprocess.run(['bash', '-c', cmd], capture_output=True, text=True, timeout=10)
+            if 'success: true' in result.stdout.lower() or 'success=true' in result.stdout.lower():
+                self._rt_started = True
+                print("[RT] 실시간 제어 시작 성공")
+
+                # 3. 토크 퍼블리셔 생성
+                self._create_torque_publisher()
+                return True
+            else:
+                print(f"[RT] 실시간 제어 시작 실패: {result.stdout}")
+                return False
+
+        except Exception as e:
+            print(f"[RT] 실시간 제어 시작 실패: {e}")
+            return False
+
+    def stop_rt_control(self) -> bool:
+        """
+        실시간 제어 모드 종료
+
+        Returns:
+            성공 여부
+        """
+        if not self._rt_started:
+            print("[RT] 실시간 제어가 시작되지 않았습니다.")
+            return True
+
+        try:
+            import subprocess
+
+            print("[RT] 실시간 제어 종료 중...")
+            cmd = (
+                f"source /opt/ros/humble/setup.bash && "
+                f"source ~/doosan_ws/install/setup.bash && "
+                f"ros2 service call /{self.ros2_namespace}/realtime/stop_rt_control "
+                f"dsr_msgs2/srv/StopRtControl"
+            )
+            result = subprocess.run(['bash', '-c', cmd], capture_output=True, text=True, timeout=10)
+
+            self._rt_started = False
+            print("[RT] 실시간 제어 종료")
+            return True
+
+        except Exception as e:
+            print(f"[RT] 실시간 제어 종료 실패: {e}")
+            self._rt_started = False
+            return False
+
+    def _create_torque_publisher(self):
+        """토크 명령 퍼블리셔 생성"""
+        if self._torque_publisher is not None:
+            return
+
+        try:
+            from dsr_msgs2.msg import TorqueRtStream
+            topic = f'/{self.ros2_namespace}/torque_rt_stream'
+            self._torque_publisher = self._ros2_node.create_publisher(TorqueRtStream, topic, 10)
+            print(f"[RT] 토크 퍼블리셔 생성: {topic}")
+        except Exception as e:
+            print(f"[RT] 토크 퍼블리셔 생성 실패: {e}")
+
+    def set_torque(self, torque: np.ndarray, time_sync: float = 0.0) -> bool:
+        """
+        관절 토크 명령 전송
+
+        Args:
+            torque: (6,) 관절 토크 [Nm]
+            time_sync: 동기화 시간 (기본값 0.0)
+
+        Returns:
+            성공 여부
+        """
+        if not self._rt_started:
+            print("[RT] 실시간 제어가 시작되지 않았습니다. start_rt_control()을 먼저 호출하세요.")
+            return False
+
+        if self._torque_publisher is None:
+            self._create_torque_publisher()
+            if self._torque_publisher is None:
+                return False
+
+        try:
+            from dsr_msgs2.msg import TorqueRtStream
+            msg = TorqueRtStream()
+            msg.tor = [float(t) for t in torque]
+            msg.time = float(time_sync)
+            self._torque_publisher.publish(msg)
+            return True
+        except Exception as e:
+            print(f"[RT] 토크 명령 전송 실패: {e}")
+            return False
+
+    def read_rt_state(self) -> Optional[RobotStateRt]:
+        """
+        실시간 로봇 상태 읽기
+
+        Returns:
+            RobotStateRt: 로봇 상태 (mass_matrix, jacobian, gravity_torque 등 포함)
+            None: 실패 시
+        """
+        if not self.use_ros2:
+            print("[RT] 실시간 상태 읽기는 ROS2 모드에서만 지원됩니다.")
+            return None
+
+        try:
+            import subprocess
+            import re
+
+            cmd = (
+                f"source /opt/ros/humble/setup.bash && "
+                f"source ~/doosan_ws/install/setup.bash && "
+                f"ros2 service call /{self.ros2_namespace}/realtime/read_data_rt "
+                f"dsr_msgs2/srv/ReadDataRt"
+            )
+            result = subprocess.run(['bash', '-c', cmd], capture_output=True, text=True, timeout=5)
+
+            if result.returncode != 0:
+                return None
+
+            # 응답 파싱
+            state = RobotStateRt()
+            output = result.stdout
+
+            # 타임스탬프
+            match = re.search(r'time_stamp:\s*([\d.]+)', output)
+            if match:
+                state.time_stamp = float(match.group(1))
+
+            # 관절 위치 (deg -> rad)
+            match = re.search(r'actual_joint_position:\s*\[([^\]]+)\]', output)
+            if match:
+                vals = [float(x) for x in match.group(1).split(',')]
+                state.joint_position = np.radians(vals)
+
+            # 관절 속도 (deg/s -> rad/s)
+            match = re.search(r'actual_joint_velocity:\s*\[([^\]]+)\]', output)
+            if match:
+                vals = [float(x) for x in match.group(1).split(',')]
+                state.joint_velocity = np.radians(vals)
+
+            # 중력 토크
+            match = re.search(r'gravity_torque:\s*\[([^\]]+)\]', output)
+            if match:
+                vals = [float(x) for x in match.group(1).split(',')]
+                state.gravity_torque = np.array(vals)
+
+            # 실제 관절 토크
+            match = re.search(r'actual_joint_torque:\s*\[([^\]]+)\]', output)
+            if match:
+                vals = [float(x) for x in match.group(1).split(',')]
+                state.actual_joint_torque = np.array(vals)
+
+            # 외부 관절 토크
+            match = re.search(r'external_joint_torque:\s*\[([^\]]+)\]', output)
+            if match:
+                vals = [float(x) for x in match.group(1).split(',')]
+                state.external_joint_torque = np.array(vals)
+
+            # TCP 위치 (mm -> m, deg -> rad)
+            match = re.search(r'actual_tcp_position:\s*\[([^\]]+)\]', output)
+            if match:
+                vals = [float(x) for x in match.group(1).split(',')]
+                # [x, y, z, a, b, c] -> [m, m, m, rad, rad, rad]
+                state.tcp_position = np.array([
+                    vals[0] / 1000, vals[1] / 1000, vals[2] / 1000,
+                    np.radians(vals[3]), np.radians(vals[4]), np.radians(vals[5])
+                ])
+
+            # 제어 모드
+            match = re.search(r'control_mode:\s*(\d+)', output)
+            if match:
+                state.control_mode = int(match.group(1))
+
+            # TODO: mass_matrix, coriolis_matrix, jacobian_matrix 파싱
+            # 이들은 Float64MultiArray 형식이라 파싱이 복잡함
+
+            self._rt_state = state
+            return state
+
+        except Exception as e:
+            print(f"[RT] 상태 읽기 실패: {e}")
+            return None
+
+    def read_rt_state_fast(self) -> Optional[RobotStateRt]:
+        """
+        빠른 실시간 로봇 상태 읽기 (ROS2 서비스 클라이언트 사용)
+
+        subprocess 대신 직접 ROS2 서비스 호출.
+        실시간 제어 루프에서 사용할 때 권장.
+
+        Returns:
+            RobotStateRt: 로봇 상태
+            None: 실패 시
+        """
+        if not self.use_ros2 or self._ros2_node is None:
+            return None
+
+        try:
+            from dsr_msgs2.srv import ReadDataRt
+
+            # 서비스 클라이언트 생성 (한 번만)
+            if not hasattr(self, '_read_rt_client'):
+                srv_name = f'/{self.ros2_namespace}/realtime/read_data_rt'
+                self._read_rt_client = self._ros2_node.create_client(ReadDataRt, srv_name)
+                # 서비스 대기
+                if not self._read_rt_client.wait_for_service(timeout_sec=2.0):
+                    print(f"[RT] 서비스 {srv_name} 대기 시간 초과")
+                    return None
+
+            # 서비스 호출
+            request = ReadDataRt.Request()
+            future = self._read_rt_client.call_async(request)
+
+            # 응답 대기 (짧은 타임아웃)
+            rclpy.spin_until_future_complete(self._ros2_node, future, timeout_sec=0.1)
+
+            if future.done():
+                response = future.result()
+                if response is not None:
+                    return self._parse_rt_state(response.data)
+
+            return None
+
+        except Exception as e:
+            print(f"[RT] 빠른 상태 읽기 실패: {e}")
+            return None
+
+    def _parse_rt_state(self, data) -> RobotStateRt:
+        """RobotStateRt 메시지를 파이썬 객체로 변환"""
+        state = RobotStateRt()
+
+        state.time_stamp = data.time_stamp
+
+        # 관절 상태 (deg -> rad)
+        state.joint_position = np.radians(data.actual_joint_position)
+        state.joint_velocity = np.radians(data.actual_joint_velocity)
+
+        # 토크
+        state.gravity_torque = np.array(data.gravity_torque)
+        state.actual_joint_torque = np.array(data.actual_joint_torque)
+        state.external_joint_torque = np.array(data.external_joint_torque)
+
+        # TCP (mm -> m, deg -> rad)
+        tcp = data.actual_tcp_position
+        state.tcp_position = np.array([
+            tcp[0] / 1000, tcp[1] / 1000, tcp[2] / 1000,
+            np.radians(tcp[3]), np.radians(tcp[4]), np.radians(tcp[5])
+        ])
+
+        # 동역학 행렬
+        if len(data.mass_matrix) == 6:
+            state.mass_matrix = np.array([row.data for row in data.mass_matrix])
+        if len(data.coriolis_matrix) == 6:
+            state.coriolis_matrix = np.array([row.data for row in data.coriolis_matrix])
+        if len(data.jacobian_matrix) == 6:
+            state.jacobian_matrix = np.array([row.data for row in data.jacobian_matrix])
+
+        state.control_mode = data.control_mode
+
+        self._rt_state = state
+        return state
+
+    def get_gravity_compensation_torque(self) -> np.ndarray:
+        """
+        현재 자세에서의 중력 보상 토크 반환
+
+        로봇이 현재 자세를 유지하기 위해 필요한 토크.
+        토크 제어 시작 시 안전하게 시작하려면 이 값을 사용.
+
+        Returns:
+            (6,) 중력 보상 토크 [Nm]
+        """
+        state = self.read_rt_state()
+        if state is not None:
+            return state.gravity_torque.copy()
+        return np.zeros(6)
+
+    @property
+    def is_rt_control_active(self) -> bool:
+        """실시간 제어가 활성화되어 있는지 확인"""
+        return self._rt_started
 
 
 # =============================================================================
