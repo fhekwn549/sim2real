@@ -36,6 +36,7 @@ from dataclasses import dataclass, field
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pen_detector_yolo import YOLOPenDetector, YOLODetectorConfig, DetectionState
 from jacobian_ik import JacobianIK
+from config.pen_workspace import DEFAULT_PEN_WORKSPACE, calculate_tilt_from_direction
 
 # ROS2 (로봇 제어용)
 try:
@@ -96,6 +97,10 @@ class Sim2RealConfig:
 
     # YOLO
     yolo_model_path: str = os.path.join(os.path.expanduser("~"), "runs/segment/train/weights/best.pt")
+
+    # 런처 모드
+    auto_exit: bool = False      # True면 목표 도달 시 자동 종료
+    auto_start: bool = False     # True면 펜 감지 시 자동 시작
 
 
 # =============================================================================
@@ -816,16 +821,26 @@ class Sim2RealV7:
             'success': success,
         }
 
-    def run(self):
-        """메인 제어 루프 - 'g' 키로 시작"""
+    def run(self) -> bool:
+        """메인 제어 루프 - 'g' 키로 시작
+
+        Returns:
+            bool: 목표 도달 성공 여부 (auto_exit 모드에서 사용)
+        """
         print("\n" + "=" * 60)
         print("Sim2Real V7 대기 모드")
         print("=" * 60)
+        if self.config.auto_start:
+            print("  [AUTO MODE] 펜 감지 시 자동 시작")
+        if self.config.auto_exit:
+            print("  [AUTO MODE] 목표 도달 시 자동 종료")
         print("조작:")
         print("  g: Policy 실행 시작")
         print("  h: Home 위치로 이동")
         print("  q: 종료")
         print("=" * 60)
+
+        success_result = False  # 최종 성공 여부
 
         dt = 1.0 / self.config.control_freq
         self.running = True
@@ -957,8 +972,34 @@ class Sim2RealV7:
                     self.action_processor.reset()
                     self.robot.move_to_home()
                     print("[Home] 완료")
-                elif key == ord('g'):
+                elif key == ord('g') or (self.config.auto_start and not policy_running and pen_result is not None and fixed_pen_result is None):
                     if not policy_running and pen_result is not None:
+                        # 펜 위치/각도 유효성 검사 (학습 범위와 동일)
+                        cap_pos = pen_result['cap_robot']
+                        pen_dir = pen_result['direction_robot'] if pen_result['direction_robot'] is not None else np.array([0.0, 0.0, 1.0])
+
+                        # 위치 검사
+                        pos_valid, pos_msg = DEFAULT_PEN_WORKSPACE.is_pen_position_valid(
+                            cap_pos[0], cap_pos[1], cap_pos[2]
+                        )
+
+                        # 기울기 검사
+                        tilt_rad = calculate_tilt_from_direction(pen_dir)
+                        tilt_valid, tilt_msg = DEFAULT_PEN_WORKSPACE.is_pen_tilt_valid(tilt_rad)
+
+                        if not pos_valid:
+                            print(f"\n[Error] 펜 위치가 학습 범위를 벗어남!")
+                            print(f"  {pos_msg}")
+                            print(f"  현재: X={cap_pos[0]*100:.1f}cm, Y={cap_pos[1]*100:.1f}cm, Z={cap_pos[2]*100:.1f}cm")
+                            DEFAULT_PEN_WORKSPACE.print_config()
+                            continue
+
+                        if not tilt_valid:
+                            print(f"\n[Error] 펜 기울기가 학습 범위를 벗어남!")
+                            print(f"  {tilt_msg}")
+                            print(f"  현재 기울기: {np.degrees(tilt_rad):.1f}°")
+                            continue
+
                         # 스크린샷 자동 저장
                         timestamp = time.strftime("%Y%m%d_%H%M%S")
                         screenshot_dir = os.path.join(os.path.expanduser("~"), "Pictures/스크린샷")
@@ -975,6 +1016,7 @@ class Sim2RealV7:
                         print("[Start] Policy 실행 시작!")
                         print(f"  펜 위치 고정: [{fixed_pen_result['cap_robot'][0]*1000:.1f}, {fixed_pen_result['cap_robot'][1]*1000:.1f}, {fixed_pen_result['cap_robot'][2]*1000:.1f}] mm")
                         print(f"  펜 방향 고정: [{fixed_pen_result['direction_robot'][0]:.3f}, {fixed_pen_result['direction_robot'][1]:.3f}, {fixed_pen_result['direction_robot'][2]:.3f}]")
+                        print(f"  펜 기울기: {np.degrees(tilt_rad):.1f}° (유효 범위 내)")
                         policy_running = True
                         reached_target = False  # 리셋
                         min_distance = float('inf')  # 리셋
@@ -1009,12 +1051,20 @@ class Sim2RealV7:
                         # 목표 근처 도달 체크 (2cm 이내 → 영구 정지)
                         if current_dist < 0.02:  # 2cm
                             reached_target = True
+                            success_result = True
                             print(f"\n  [목표 도달!] dist={current_dist*100:.1f}cm - 정지")
+                            if self.config.auto_exit:
+                                print("  [AUTO EXIT] 목표 도달 - 자동 종료")
+                                self.running = False
 
                         # 진동 감지: 최소 거리에서 3cm 이상 멀어지면 정지 (더 민감하게)
                         elif min_distance < 0.10 and current_dist > min_distance + 0.03:
                             reached_target = True
+                            success_result = True  # 진동 감지도 목표 근처 도달로 간주
                             print(f"\n  [진동 감지!] min={min_distance*100:.1f}cm → now={current_dist*100:.1f}cm - 정지")
+                            if self.config.auto_exit:
+                                print("  [AUTO EXIT] 목표 근처 도달 - 자동 종료")
+                                self.running = False
 
                         # 로그
                         if step_count % 10 == 0:
@@ -1055,8 +1105,10 @@ class Sim2RealV7:
         cv2.destroyAllWindows()
 
         print("\n" + "=" * 60)
-        print("종료")
+        print(f"종료 (성공: {success_result})")
         print("=" * 60)
+
+        return success_result
 
     def shutdown(self):
         """종료"""
@@ -1091,6 +1143,10 @@ def main():
                        help="안전 체크 비활성화 (테스트용, 주의!)")
     parser.add_argument("--safety-z", type=float, default=0.05,
                        help="안전 Z 최소 높이 (미터, 기본: 0.05)")
+    parser.add_argument("--auto-exit", action="store_true",
+                       help="목표 도달 시 자동 종료 (런처 모드)")
+    parser.add_argument("--auto-start", action="store_true",
+                       help="펜 감지 시 자동 시작 (런처 모드)")
 
     args = parser.parse_args()
 
@@ -1105,6 +1161,8 @@ def main():
         gripper_offset_z=args.gripper_offset,
         disable_safety=args.no_safety,
         safety_min_z=args.safety_z,
+        auto_exit=args.auto_exit,
+        auto_start=args.auto_start,
     )
 
     # 컨트롤러 생성
