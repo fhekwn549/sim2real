@@ -132,6 +132,9 @@ class Sim2RealConfig:
     # YOLO
     yolo_model_path: str = "/home/fhekwn549/runs/segment/train/weights/best.pt"
 
+    # 외부 트리거 (UI 연동)
+    trigger_file: str = None  # 트리거 파일 경로 (있으면 파일 감지 시 시작)
+
 
 # =============================================================================
 # Action 후처리
@@ -953,6 +956,15 @@ class Sim2RealUnified:
 
                 key = cv2.waitKey(1) & 0xFF
 
+                # 트리거 파일 확인 (UI 연동)
+                trigger_start = False
+                if self.config.trigger_file and os.path.exists(self.config.trigger_file):
+                    trigger_start = True
+                    try:
+                        os.remove(self.config.trigger_file)
+                    except:
+                        pass
+
                 # 키 입력
                 if key == ord('q'):
                     break
@@ -965,7 +977,7 @@ class Sim2RealUnified:
                         rt_started = False
                     self.robot.move_to_home()
                     print("[Home] 완료")
-                elif key == ord('g'):
+                elif key == ord('g') or trigger_start:
                     if not policy_running and pen_result is not None:
                         fixed_pen_result = {
                             'cap_robot': pen_result['cap_robot'].copy(),
@@ -1126,6 +1138,8 @@ def main():
                         help="그리퍼 오프셋 (미터), TCP에서 그립 포인트까지 거리")
     parser.add_argument("--no-safety", action="store_true",
                         help="안전 체크 비활성화")
+    parser.add_argument("--trigger-file", type=str, default=None,
+                        help="외부 트리거 파일 경로 (UI 연동용)")
 
     args = parser.parse_args()
 
@@ -1145,6 +1159,7 @@ def main():
         osc_damping_ratio=args.osc_damping,
         gripper_offset_z=args.gripper_offset,
         disable_safety=args.no_safety,
+        trigger_file=args.trigger_file,
     )
 
     # 컨트롤러 생성

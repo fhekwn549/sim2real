@@ -3,10 +3,15 @@
 캘리브레이션된 펜 감지 테스트 (YOLO 세그멘테이션)
 
 펜 감지 결과를 로봇 좌표계로 변환하여 표시합니다.
-'g' 키를 누르면 로봇이 펜 위치 위로 이동합니다.
+학습 범위 내에 있는지 실시간으로 검증합니다.
 
 Usage:
     python test_pen_detection_calibrated.py
+
+조작:
+    g: 펜 위치로 로봇 이동 (100mm 위)
+    r: Cap/Tip 트래킹 리셋
+    q: 종료
 """
 
 import numpy as np
@@ -18,6 +23,7 @@ import threading
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pen_detector_yolo import YOLOPenDetector, YOLODetectorConfig, DetectionState
+from config.pen_workspace import DEFAULT_PEN_WORKSPACE, calculate_tilt_from_direction
 
 # ROS2
 try:
@@ -275,9 +281,15 @@ class RobotMover:
 
 def main():
     print("=" * 60)
-    print("캘리브레이션된 펜 감지 테스트 (YOLO 세그멘테이션)")
+    print("캘리브레이션된 펜 감지 테스트 + 학습 범위 검증")
     print("=" * 60)
-    print("펜 위치가 카메라 좌표(Cam)와 로봇 좌표(Robot)로 표시됩니다.")
+    print("펜 위치가 로봇 좌표로 표시되고, 학습 범위 내인지 검증됩니다.")
+    print("")
+    print("학습 범위 (펜 캡 위치):")
+    print(f"  X: {DEFAULT_PEN_WORKSPACE.pen_x_range[0]*100:.0f} ~ {DEFAULT_PEN_WORKSPACE.pen_x_range[1]*100:.0f} cm")
+    print(f"  Y: {DEFAULT_PEN_WORKSPACE.pen_y_range[0]*100:.0f} ~ {DEFAULT_PEN_WORKSPACE.pen_y_range[1]*100:.0f} cm")
+    print(f"  Z: {DEFAULT_PEN_WORKSPACE.pen_z_range[0]*100:.0f} ~ {DEFAULT_PEN_WORKSPACE.pen_z_range[1]*100:.0f} cm")
+    print(f"  최대 기울기: {np.degrees(DEFAULT_PEN_WORKSPACE.pen_tilt_max):.0f}도")
     print("")
     print("조작:")
     print("  g: 펜 위치로 로봇 이동 (100mm 위)")
@@ -302,6 +314,11 @@ def main():
 
     last_robot_pos = None  # 마지막 감지된 로봇 좌표
 
+    # 이동 평균 필터 (노이즈 제거)
+    pos_history = []
+    dir_history = []
+    FILTER_SIZE = 10  # 최근 10프레임 평균 (더 안정적)
+
     try:
         while True:
             # 먼저 감지 수행 (내부적으로 프레임 가져옴)
@@ -316,9 +333,22 @@ def main():
             display = detector.visualize(color_image, result)
 
             if result is not None:
-                # 로봇 좌표 표시 (화면 오른쪽)
-                robot_pos = result['grasp_robot']
+                # 로봇 좌표 (이동 평균 필터 적용)
+                robot_pos_raw = result['grasp_robot']
+                pos_history.append(robot_pos_raw.copy())
+                if len(pos_history) > FILTER_SIZE:
+                    pos_history.pop(0)
+                robot_pos = np.mean(pos_history, axis=0)
                 last_robot_pos = robot_pos.copy()
+
+                # 방향도 필터링
+                if result['direction_robot'] is not None:
+                    dir_history.append(result['direction_robot'].copy())
+                    if len(dir_history) > FILTER_SIZE:
+                        dir_history.pop(0)
+                    filtered_dir = np.mean(dir_history, axis=0)
+                    filtered_dir = filtered_dir / (np.linalg.norm(filtered_dir) + 1e-6)
+                    result['direction_robot'] = filtered_dir
 
                 # 로봇 좌표 (mm 단위) - 오른쪽에 표시
                 robot_mm = robot_pos * 1000
@@ -339,9 +369,58 @@ def main():
                     cv2.putText(display, f"Dir: [{dir_r[0]:+.2f}, {dir_r[1]:+.2f}, {dir_r[2]:+.2f}]",
                                (x_offset, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 255), 1)
 
+                # ============================================================
+                # 학습 범위 검증
+                # ============================================================
+                pos_valid, pos_msg = DEFAULT_PEN_WORKSPACE.is_pen_position_valid(
+                    robot_pos[0], robot_pos[1], robot_pos[2]
+                )
+
+                tilt_valid = True
+                tilt_msg = "OK"
+                tilt_deg = 0.0
+                if result['direction_robot'] is not None:
+                    tilt_rad = calculate_tilt_from_direction(result['direction_robot'])
+                    tilt_deg = np.degrees(tilt_rad)
+                    tilt_valid, tilt_msg = DEFAULT_PEN_WORKSPACE.is_pen_tilt_valid(tilt_rad)
+
+                # 전체 유효 여부
+                all_valid = pos_valid and tilt_valid
+
+                # 범위 검증 결과 표시
+                y_start = 150
+                cv2.putText(display, "=== WORKSPACE CHECK ===",
+                           (x_offset, y_start), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
+
+                # 위치 상태
+                pos_color = (0, 255, 0) if pos_valid else (0, 0, 255)
+                pos_text = "OK" if pos_valid else "OUT"
+                cv2.putText(display, f"Pos: {pos_text}",
+                           (x_offset, y_start + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, pos_color, 2)
+
+                # 기울기 상태
+                tilt_color = (0, 255, 0) if tilt_valid else (0, 0, 255)
+                cv2.putText(display, f"Tilt: {tilt_deg:.1f} deg",
+                           (x_offset, y_start + 50), cv2.FONT_HERSHEY_SIMPLEX, 0.5, tilt_color, 2)
+
+                # 전체 상태 (큰 글씨로)
+                if all_valid:
+                    cv2.putText(display, "IN RANGE",
+                               (x_offset, y_start + 80), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                else:
+                    cv2.putText(display, "OUT OF RANGE",
+                               (x_offset, y_start + 80), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                    # 오류 메시지
+                    if not pos_valid:
+                        cv2.putText(display, pos_msg[:30],
+                                   (x_offset, y_start + 105), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 255), 1)
+                    if not tilt_valid:
+                        cv2.putText(display, tilt_msg[:30],
+                                   (x_offset, y_start + 120), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 255), 1)
+
                 # 안내
                 cv2.putText(display, "[G] Move robot",
-                           (x_offset, 145), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
+                           (x_offset, y_start + 145), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
 
             # 캘리브레이션 상태 표시
             status_text = "CALIBRATED" if calibrated else "NOT CALIBRATED!"
