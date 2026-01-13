@@ -62,13 +62,13 @@ mkdir -p ~/doosan_ws/src
 cd ~/doosan_ws/src
 
 # Doosan 드라이버 (포크 버전 - Flange Serial 지원)
-git clone -b humble https://github.com/fhekwn549/doosan-robot2.git
+git clone -b humble https://github.com/KERNEL3-2/doosan-robot2.git
 
 # 그리퍼 패키지
 git clone https://github.com/ROBOTIS-GIT/RH-P12-RN-A.git
 
 # 로봇 description 패키지
-git clone https://github.com/fhekwn549/e0509_gripper_description.git
+git clone https://github.com/KERNEL3-2/e0509_gripper_description.g
 
 # 빌드
 cd ~/doosan_ws
@@ -80,7 +80,7 @@ source install/setup.bash
 ### 2. Sim2Real 레포 클론
 ```bash
 cd ~
-git clone https://github.com/fhekwn549/sim2real.git
+git clone https://github.com/KERNEL3-2/sim2real.git
 ```
 
 ### 3. Python 의존성 설치
