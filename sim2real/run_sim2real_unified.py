@@ -1089,7 +1089,6 @@ class Sim2RealUnified:
                 self.robot.stop_rt_control()
 
             self.running = False
-            cv2.destroyAllWindows()
 
         print("\n" + "=" * 60)
         print("종료")
@@ -1098,8 +1097,14 @@ class Sim2RealUnified:
     def shutdown(self):
         """종료"""
         self.running = False
+        # 카메라 먼저 종료
         if self.detector:
             self.detector.stop()
+        # OpenCV 창 종료 (카메라 종료 후)
+        cv2.waitKey(1)
+        cv2.destroyAllWindows()
+        cv2.waitKey(1)
+        # 로봇 연결 해제
         self.robot.disconnect()
         print("Sim2Real 종료")
 
