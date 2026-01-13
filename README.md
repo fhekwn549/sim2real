@@ -125,10 +125,32 @@ python pen_grasp_rl/scripts/play_v7.py --checkpoint <model_path>
 # 터미널 1: 로봇 bringup
 ros2 launch e0509_gripper_description bringup.launch.py mode:=real host:=<robot_ip>
 
-# 터미널 2: Sim2Real 실행
-cd ~/sim2real/sim2real
-python run_sim2real.py --checkpoint <model_path>
+# 터미널 2: 그리퍼 서비스 (옵션)
+ros2 run e0509_gripper_description gripper_service_node.py --ros-args -p mode:=real
+
+# 터미널 3: Sim2Real 실행 (IK 모드 - 스플라인 궤적)
+python3 ~/sim2real/sim2real/run_sim2real_unified.py \
+  --mode ik \
+  --checkpoint <model_path> \
+  --calibration ~/sim2real/sim2real/config/calibration_eye_to_hand.npz
 ```
+
+### 주요 옵션
+| 옵션 | 기본값 | 설명 |
+|------|--------|------|
+| `--mode` | ik | 제어 모드 (ik 또는 osc) |
+| `--checkpoint` | (필수) | 학습된 정책 파일 (.pt) |
+| `--calibration` | - | Eye-to-Hand 캘리브레이션 파일 |
+| `--duration` | 0 | 최대 실행 시간 (0=무제한) |
+| `--gripper-offset` | 0.07 | TCP에서 그립 포인트까지 거리 (m) |
+| `--spline-batch` | 50 | 스플라인 웨이포인트 배치 크기 |
+| `--spline-skip` | 1 | 웨이포인트 건너뛰기 (1=전부, 2=절반) |
+
+### 조작 키
+- `g`: Policy 실행 시작
+- `h`: Home 위치로 이동
+- `s`: Cap/Tip 위치 교환
+- `q`: 종료
 
 
 

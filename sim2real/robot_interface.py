@@ -31,6 +31,7 @@ Usage:
 import numpy as np
 import time
 import math
+import os
 from typing import Tuple, Optional, List
 from dataclasses import dataclass, field
 
@@ -96,8 +97,8 @@ class DoosanRobot:
         'upper': [360, 95, 135, 360, 135, 360]
     }
 
-    # Home 자세 (도)
-    HOME_JOINT_DEG = [0, 0, 90, 0, 90, 0]
+    # Home 자세 (도) - 학습 초기 자세와 동일
+    HOME_JOINT_DEG = [0, -17.2, 45.8, 0, 90, 0]
 
     def __init__(self, ip: str = "192.168.137.100", simulation: bool = False,
                  use_ros2: bool = True, ros2_namespace: str = "dsr01"):
@@ -136,6 +137,9 @@ class DoosanRobot:
         self._rt_started = False
         self._rt_state = RobotStateRt()
         self._torque_publisher = None
+
+        # Servo 제어 관련
+        self._servo_publisher = None
 
         if self.use_ros2:
             print(f"[Robot] ROS2 mode, namespace: /{ros2_namespace}")
@@ -222,7 +226,22 @@ class DoosanRobot:
     def _joint_state_callback(self, msg: 'JointState'):
         """Joint state 콜백"""
         if len(msg.position) >= 6:
-            self._ros2_joint_pos = np.array(msg.position[:6])
+            # 조인트 이름 순서대로 정렬 (joint_1, joint_2, ..., joint_6)
+            joint_names = list(msg.name)
+            positions = list(msg.position)
+
+            # 예상 순서: joint_1, joint_2, joint_3, joint_4, joint_5, joint_6
+            expected_order = ['joint_1', 'joint_2', 'joint_3', 'joint_4', 'joint_5', 'joint_6']
+
+            reordered = np.zeros(6)
+            for i, expected_name in enumerate(expected_order):
+                if expected_name in joint_names:
+                    idx = joint_names.index(expected_name)
+                    reordered[i] = positions[idx]
+                elif i < len(positions):
+                    reordered[i] = positions[i]  # fallback
+
+            self._ros2_joint_pos = reordered
 
     def _robot_state_callback(self, msg):
         """Robot state 콜백 (TCP 포함)"""
@@ -247,6 +266,57 @@ class DoosanRobot:
 
         self.connected = False
         print("[Robot] Disconnected")
+
+    # =========================================================================
+    # 그리퍼 제어
+    # =========================================================================
+    def gripper_open(self) -> bool:
+        """그리퍼 열기"""
+        return self._gripper_command("open")
+
+    def gripper_close(self) -> bool:
+        """그리퍼 닫기"""
+        return self._gripper_command("close")
+
+    def gripper_set_position(self, position: int) -> bool:
+        """그리퍼 위치 설정 (0=열림, 700=닫힘)"""
+        return self._gripper_command(f"pos {position}")
+
+    def _gripper_command(self, cmd: str) -> bool:
+        """그리퍼 명령 실행 (ROS2 Trigger 서비스 사용)"""
+        if self.simulation:
+            print(f"[Gripper] (시뮬레이션) {cmd}")
+            return True
+
+        import subprocess
+
+        try:
+            # /dsr01/gripper/open, /dsr01/gripper/close 서비스 사용
+            # gripper_service_node.py가 실행 중이어야 함
+            if cmd == "open":
+                service_cmd = f"ros2 service call /dsr01/gripper/open std_srvs/srv/Trigger"
+            elif cmd == "close":
+                service_cmd = f"ros2 service call /dsr01/gripper/close std_srvs/srv/Trigger"
+            else:
+                print(f"[Gripper] 알 수 없는 명령: {cmd}")
+                return False
+
+            print(f"[Gripper] {cmd} 명령 실행 중...")
+            result = subprocess.run(service_cmd, shell=True, capture_output=True, text=True, timeout=15)
+
+            if "success=True" in result.stdout or "success: true" in result.stdout.lower():
+                print(f"[Gripper] {cmd} 완료")
+                return True
+            else:
+                print(f"[Gripper] {cmd} 실패: {result.stdout[:200]}")
+                return False
+
+        except subprocess.TimeoutExpired:
+            print(f"[Gripper] {cmd} 타임아웃")
+            return False
+        except Exception as e:
+            print(f"[Gripper] {cmd} 오류: {e}")
+            return False
 
     def get_joint_positions(self) -> np.ndarray:
         """
@@ -442,6 +512,11 @@ class DoosanRobot:
                 time.sleep(0.1)
             return True
 
+        # ROS2 서비스 사용
+        if self.use_ros2:
+            return self._move_joint_ros2(target_deg, vel, acc, wait)
+
+        # DRFL 사용
         try:
             DRFL.movej(target_deg, vel=vel, acc=acc)
             if wait:
@@ -449,6 +524,38 @@ class DoosanRobot:
             return True
         except Exception as e:
             print(f"[Robot] Move joint failed: {e}")
+            return False
+
+    def _move_joint_ros2(self, target_deg: list, vel: float, acc: float, wait: bool,
+                         blend_type: int = 1, radius: float = 20.0) -> bool:
+        """ROS2 서비스로 관절 이동
+
+        Args:
+            blend_type: 0=블렌딩없음, 1=다음모션과블렌딩
+            radius: 블렌딩 반경 (mm), blend_type=1일때 사용
+        """
+        import subprocess
+        try:
+            # sync_type: 0=비동기, 1=동기
+            sync_type = 1 if wait else 0
+            # blend_type=1, radius=20mm로 부드러운 연속 이동
+            cmd = [
+                'ros2', 'service', 'call',
+                f'/{self.ros2_namespace}/motion/move_joint',
+                'dsr_msgs2/srv/MoveJoint',
+                f'{{pos: {target_deg}, vel: {vel}, acc: {acc}, time: 0.0, radius: {radius}, mode: 0, blend_type: {blend_type}, sync_type: {sync_type}}}'
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+            if 'success=True' in result.stdout or 'success: true' in result.stdout.lower():
+                return True
+            else:
+                print(f"[Robot] MoveJoint failed: {result.stdout}")
+                return False
+        except subprocess.TimeoutExpired:
+            print("[Robot] MoveJoint timeout")
+            return False
+        except Exception as e:
+            print(f"[Robot] MoveJoint error: {e}")
             return False
 
     def move_joint_delta(self, delta_rad: np.ndarray, vel: float = 30, acc: float = 30,
@@ -462,6 +569,137 @@ class DoosanRobot:
         current = self.get_joint_positions()
         target = current + delta_rad
         return self.move_joint(target, vel, acc, wait)
+
+    def move_spline_joint(self, waypoints_rad: list, vel: float = 30, acc: float = 30,
+                          time_sec: float = 0.0, wait: bool = True) -> bool:
+        """
+        스플라인 궤적으로 여러 웨이포인트를 부드럽게 이동
+
+        Args:
+            waypoints_rad: list of (6,) 관절 위치들 (라디안), 최대 100개
+            vel: 속도 (도/초)
+            acc: 가속도 (도/초^2)
+            time_sec: 전체 이동 시간 (0이면 vel/acc 사용)
+            wait: 완료까지 대기 여부
+
+        Returns:
+            성공 여부
+        """
+        if len(waypoints_rad) == 0:
+            return True
+
+        if len(waypoints_rad) > 100:
+            print(f"[Robot] Spline waypoints 최대 100개, {len(waypoints_rad)}개 → 100개로 제한")
+            waypoints_rad = waypoints_rad[:100]
+
+        # ROS2 서비스 사용
+        if self.use_ros2:
+            return self._move_spline_joint_ros2(waypoints_rad, vel, acc, time_sec, wait)
+
+        # DRFL이나 시뮬레이션은 순차 이동으로 대체
+        for wp in waypoints_rad:
+            self.move_joint(wp, vel, acc, wait=True)
+        return True
+
+    def _move_spline_joint_ros2(self, waypoints_rad: list, vel: float, acc: float,
+                                 time_sec: float, wait: bool) -> bool:
+        """ROS2 서비스로 스플라인 관절 이동"""
+        import subprocess
+        import json
+
+        try:
+            # 웨이포인트를 도 단위로 변환
+            pos_arrays = []
+            for wp in waypoints_rad:
+                wp_deg = np.degrees(np.array(wp)).tolist()
+                pos_arrays.append(wp_deg)
+
+            pos_cnt = len(waypoints_rad)
+            vel_list = [float(vel)] * 6
+            acc_list = [float(acc)] * 6
+            sync_type = 0 if wait else 1
+
+            # Float64MultiArray 형식으로 변환
+            # 각 웨이포인트는 {data: [j1, j2, j3, j4, j5, j6]} 형태
+            pos_str_list = []
+            for wp_deg in pos_arrays:
+                pos_str_list.append(f"{{data: {wp_deg}}}")
+            pos_str = "[" + ", ".join(pos_str_list) + "]"
+
+            cmd = [
+                'ros2', 'service', 'call',
+                f'/{self.ros2_namespace}/motion/move_spline_joint',
+                'dsr_msgs2/srv/MoveSplineJoint',
+                f'{{pos: {pos_str}, pos_cnt: {pos_cnt}, vel: {vel_list}, acc: {acc_list}, time: {time_sec}, mode: 0, sync_type: {sync_type}}}'
+            ]
+
+            timeout = max(30, len(waypoints_rad) * 2)  # 웨이포인트 수에 따라 타임아웃 조정
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+
+            if 'success=True' in result.stdout or 'success: true' in result.stdout.lower():
+                return True
+            else:
+                print(f"[Robot] MoveSplineJoint failed: {result.stdout[:200]}")
+                return False
+
+        except subprocess.TimeoutExpired:
+            print("[Robot] MoveSplineJoint timeout")
+            return False
+        except Exception as e:
+            print(f"[Robot] MoveSplineJoint error: {e}")
+            return False
+
+    def servoj(self, target_rad: np.ndarray, vel: float = 30.0, acc: float = 30.0,
+               time_sec: float = 0.0) -> bool:
+        """
+        Servo 모드로 관절 이동 (연속 스트리밍용, 끊김 없음)
+
+        Args:
+            target_rad: (6,) 목표 관절 위치 (라디안)
+            vel: 속도 (도/초)
+            acc: 가속도 (도/초^2)
+            time_sec: 이동 시간 (0이면 vel/acc 사용)
+
+        Returns:
+            성공 여부
+        """
+        if not self.use_ros2:
+            # ROS2가 아니면 일반 move_joint 사용
+            return self.move_joint(target_rad, vel, acc, wait=False)
+
+        # Servo 퍼블리셔 생성 (처음 호출시)
+        if self._servo_publisher is None:
+            try:
+                from dsr_msgs2.msg import ServojStream
+                self._servo_publisher = self._ros2_node.create_publisher(
+                    ServojStream, '/servoj_stream', 10
+                )
+                print("[Robot] Servo publisher created: /servoj_stream")
+            except Exception as e:
+                print(f"[Robot] Failed to create servo publisher: {e}")
+                return self.move_joint(target_rad, vel, acc, wait=False)
+
+        try:
+            from dsr_msgs2.msg import ServojStream
+
+            # 라디안 → 도 변환
+            target_deg = np.degrees(target_rad)
+            vel_arr = np.full(6, float(vel))
+            acc_arr = np.full(6, float(acc))
+
+            msg = ServojStream()
+            msg.pos = target_deg.astype(np.float64).tolist()
+            msg.vel = vel_arr.astype(np.float64).tolist()
+            msg.acc = acc_arr.astype(np.float64).tolist()
+            msg.time = float(time_sec)
+            msg.mode = 0  # DR_SERVO_OVERRIDE: 즉시 새 위치로
+
+            self._servo_publisher.publish(msg)
+            return True
+
+        except Exception as e:
+            print(f"[Robot] Servoj error: {e}")
+            return self.move_joint(target_rad, vel, acc, wait=False)
 
     def move_linear(self, position: np.ndarray, rotation: np.ndarray = None,
                     vel: float = 100, acc: float = 100, wait: bool = True) -> bool:
@@ -615,7 +853,23 @@ class DoosanRobot:
         try:
             import subprocess
 
-            # 1. 실시간 제어 연결 (이미 연결되어 있을 수 있음)
+            # 0. 먼저 기존 연결 정리 시도 (무시 가능)
+            print("[RT] 기존 RT 연결 정리 중...")
+            disconnect_cmd = (
+                f"source /opt/ros/humble/setup.bash && "
+                f"source ~/doosan_ws/install/setup.bash && "
+                f"ros2 service call /{self.ros2_namespace}/realtime/disconnect_rt_control "
+                f"dsr_msgs2/srv/DisconnectRtControl"
+            )
+            try:
+                subprocess.run(['bash', '-c', disconnect_cmd], capture_output=True, text=True, timeout=5)
+            except:
+                pass  # 실패해도 무시
+
+            import time
+            time.sleep(0.5)  # 잠시 대기
+
+            # 1. 실시간 제어 연결
             if not self._rt_connected:
                 print("[RT] 실시간 제어 연결 중...")
                 cmd = (
@@ -624,14 +878,17 @@ class DoosanRobot:
                     f"ros2 service call /{self.ros2_namespace}/realtime/connect_rt_control "
                     f"dsr_msgs2/srv/ConnectRtControl '{{ip_address: \"{self.ip}\", port: 12347}}'"
                 )
-                result = subprocess.run(['bash', '-c', cmd], capture_output=True, text=True, timeout=10)
+                result = subprocess.run(['bash', '-c', cmd], capture_output=True, text=True, timeout=15)
                 if 'success: true' in result.stdout.lower() or 'success=true' in result.stdout.lower():
                     self._rt_connected = True
                     print("[RT] 실시간 제어 연결 성공")
-                else:
+                elif result.returncode == 0:
                     # 이미 연결되어 있을 수 있음
                     print("[RT] 실시간 제어 연결 (이미 연결됨)")
                     self._rt_connected = True
+                else:
+                    print(f"[RT] 연결 실패: {result.stderr}")
+                    return False
 
             # 2. 실시간 제어 시작
             print("[RT] 실시간 제어 시작 중...")

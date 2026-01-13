@@ -305,6 +305,29 @@ class YOLOPenDetector:
             self.kf_center.reset()
         print("[YOLOPenDetector] Tracking reset")
 
+    def swap_cap_tip(self):
+        """Cap과 Tip을 수동으로 swap (잘못 인식된 경우 사용)"""
+        if self._cap_pixel_ema is not None and self._tip_pixel_ema is not None:
+            # EMA 값 swap
+            self._cap_pixel_ema, self._tip_pixel_ema = self._tip_pixel_ema.copy(), self._cap_pixel_ema.copy()
+
+            # 방향 벡터 반전
+            if self._direction_ema is not None:
+                self._direction_ema = -self._direction_ema
+
+            # 칼만 필터의 cap/tip 상태도 swap
+            if self.kf_cap and self.kf_tip and self.kf_cap.initialized and self.kf_tip.initialized:
+                cap_state = self.kf_cap.state.copy()
+                tip_state = self.kf_tip.state.copy()
+                self.kf_cap.state = tip_state
+                self.kf_tip.state = cap_state
+
+            print("[YOLOPenDetector] Cap/Tip swapped!")
+            return True
+        else:
+            print("[YOLOPenDetector] Cannot swap - no tracking data yet")
+            return False
+
     def get_last_frames(self) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
         """마지막 detect()에서 사용한 프레임 반환 (동기화용)"""
         return self._last_color_image, self._last_depth_image

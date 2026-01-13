@@ -36,6 +36,7 @@ import cv2
 from typing import Optional, Tuple
 from dataclasses import dataclass
 from enum import Enum
+from scipy.spatial.transform import Rotation as R
 
 # 로컬 모듈
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -50,6 +51,14 @@ try:
 except ImportError:
     HAS_YOLO = False
     print("[Warning] YOLO detector not available")
+
+# 펜 작업 공간 설정
+try:
+    from config.pen_workspace import DEFAULT_PEN_WORKSPACE, calculate_tilt_from_direction
+    HAS_WORKSPACE = True
+except ImportError:
+    HAS_WORKSPACE = False
+    print("[Warning] pen_workspace not available")
 
 
 class ControlMode(Enum):
@@ -69,14 +78,20 @@ class Sim2RealConfig:
 
     # Policy
     checkpoint_path: str = ""
-    action_scale: float = 0.03  # 환경과 동일
+    action_scale: float = 0.01  # 1cm per action unit
 
     # 제어 주파수
-    control_freq_ik: float = 10.0    # IK 모드 (Hz)
-    control_freq_osc: float = 100.0  # OSC 모드 (Hz)
+    control_freq_ik: float = 30.0    # IK 모드 (Hz) - 웨이포인트 수집 주파수
+    control_freq_osc: float = 30.0   # OSC 모드 (Hz) - 낮을수록 느린 움직임
+
+    # 스플라인 설정 (IK 모드)
+    spline_batch_size: int = 50      # 한 번에 전송할 웨이포인트 수 (최대 100)
+    spline_vel: float = 60.0         # 스플라인 속도 (도/초)
+    spline_acc: float = 60.0         # 스플라인 가속도 (도/초^2)
+    spline_skip: int = 1             # N개 중 1개만 저장 (1=전부, 2=절반, 3=1/3)
 
     # 최대 실행 시간
-    max_duration: float = 60.0  # 초
+    max_duration: float = 0.0  # 0=무제한
 
     # 캘리브레이션
     calibration_path: str = ""
@@ -86,26 +101,32 @@ class Sim2RealConfig:
     success_perp_dist: float = 0.01    # 1cm
     success_hold_steps: int = 30
 
-    # 그리퍼 오프셋
-    gripper_offset_z: float = 0.08  # TCP → Grasp point
+    # 그리퍼 오프셋 (TCP에서 실제 그립 포인트까지 거리)
+    gripper_offset_z: float = 0.07  # TCP에서 그립 포인트까지 오프셋 (7cm)
 
     # 안전 설정
     disable_safety: bool = False
-    max_tcp_delta: float = 0.05  # 5cm per step
+    max_tcp_delta: float = 0.010  # 10mm per step (OSC용)
+    max_tcp_delta_ik: float = 0.01  # 10mm per step (IK용, 30Hz면 300mm/s)
     safety_min_z: float = 0.05   # 최소 Z 높이
     workspace_x: Tuple[float, float] = (-0.2, 0.8)
     workspace_y: Tuple[float, float] = (-0.5, 0.5)
-    workspace_z: Tuple[float, float] = (0.05, 0.6)
+    workspace_z: Tuple[float, float] = (0.05, 0.9)  # 상한 90cm로 확장
+
+    # 관절 제한 (초기 자세 대비 최대 변화량, 도)
+    joint1_max_delta_deg: float = 45.0  # joint 1 최대 ±45도
+    joint_limits_from_init: bool = True  # 초기 자세 기준 제한 활성화
 
     # Action 후처리
-    smooth_alpha: float = 0.7
+    smooth_alpha: float = 0.3  # 더 부드러운 움직임 (vel=30 수준)
     dead_zone_cm: float = 2.0
     scale_by_dist: bool = True
     scale_min: float = 0.3
     scale_range_cm: float = 10.0
 
     # OSC 설정
-    osc_stiffness: float = 150.0
+    osc_stiffness_pos: float = 200.0  # 위치 강성 (너무 높으면 충돌 감지 트리거)
+    osc_stiffness_rot: float = 100.0  # 회전 강성
     osc_damping_ratio: float = 1.0
 
     # YOLO
@@ -281,7 +302,7 @@ class Sim2RealUnified:
         else:
             print(f"  제어 주파수: {config.control_freq_osc} Hz")
             print(f"  제어 방식: OSC → Torque")
-            print(f"  OSC 강성: {config.osc_stiffness}")
+            print(f"  OSC 위치강성: {config.osc_stiffness_pos}, 회전강성: {config.osc_stiffness_rot}")
         print("=" * 60)
 
     def _load_policy(self, checkpoint_path: str) -> PolicyNetwork:
@@ -310,13 +331,14 @@ class Sim2RealUnified:
 
         else:  # OSC 모드
             # OSC 컨트롤러
+            # 위치/회전 강성 분리 설정
             stiffness = np.array([
-                self.config.osc_stiffness,
-                self.config.osc_stiffness,
-                self.config.osc_stiffness,
-                self.config.osc_stiffness / 3,
-                self.config.osc_stiffness / 3,
-                self.config.osc_stiffness / 3,
+                self.config.osc_stiffness_pos,  # 위치 X
+                self.config.osc_stiffness_pos,  # 위치 Y
+                self.config.osc_stiffness_pos,  # 위치 Z
+                self.config.osc_stiffness_rot,  # 회전 X (높은 강성)
+                self.config.osc_stiffness_rot,  # 회전 Y
+                self.config.osc_stiffness_rot,  # 회전 Z
             ])
             self.osc = OperationalSpaceController(
                 stiffness=stiffness,
@@ -326,7 +348,7 @@ class Sim2RealUnified:
             )
             self.ik = JacobianIK(lambda_val=0.05)  # FK 계산용
             print(f"  → OSC 컨트롤러 초기화 완료")
-            print(f"     강성: {stiffness[:3]}")
+            print(f"     위치 강성: {stiffness[:3]}, 회전 강성: {stiffness[3:]}")
 
     def build_observation(
         self,
@@ -382,12 +404,88 @@ class Sim2RealUnified:
 
         return True, "OK"
 
+    def _compute_rotation_to_pen(self, current_quat: np.ndarray, pen_direction: np.ndarray) -> np.ndarray:
+        """
+        펜 방향에 맞게 그리퍼를 정렬하기 위한 회전 델타 계산
+
+        Args:
+            current_quat: 현재 그리퍼 quaternion [w, x, y, z]
+            pen_direction: 펜 방향 벡터 (정규화됨)
+
+        Returns:
+            rot_delta: axis-angle 회전 [rx, ry, rz] (rad)
+        """
+        # 그리퍼가 펜을 잡을 때, 그리퍼의 Z축이 펜 축과 정렬되어야 함
+        # 펜이 아래를 향하면 그리퍼도 아래를 향해야 함
+
+        # 현재 그리퍼 Z축 (quaternion에서 추출)
+        # quat = [w, x, y, z]
+        w, x, y, z = current_quat
+        # 회전 행렬의 Z축 (3번째 열)
+        current_z = np.array([
+            2 * (x*z + w*y),
+            2 * (y*z - w*x),
+            1 - 2*(x*x + y*y)
+        ])
+
+        # 목표: 그리퍼 Z축을 -pen_direction으로 정렬 (펜 캡을 향해 접근)
+        # 펜이 위를 향하면 그리퍼는 아래를 향해야 함
+        target_z = -pen_direction
+        target_z = target_z / (np.linalg.norm(target_z) + 1e-8)
+
+        # 두 벡터 사이의 회전 계산
+        current_z = current_z / (np.linalg.norm(current_z) + 1e-8)
+
+        # 회전축 (cross product)
+        axis = np.cross(current_z, target_z)
+        axis_norm = np.linalg.norm(axis)
+
+        if axis_norm < 1e-6:
+            # 이미 정렬됨 또는 반대 방향
+            dot = np.dot(current_z, target_z)
+            if dot < 0:
+                # 180도 회전 필요 - 임의의 수직 축 사용
+                axis = np.array([1, 0, 0]) if abs(current_z[0]) < 0.9 else np.array([0, 1, 0])
+                axis = np.cross(current_z, axis)
+                axis = axis / np.linalg.norm(axis)
+                angle = np.pi * 0.1  # 천천히 회전
+            else:
+                return np.zeros(3)  # 이미 정렬됨
+        else:
+            axis = axis / axis_norm
+            # 회전 각도 (dot product)
+            dot = np.clip(np.dot(current_z, target_z), -1, 1)
+            angle = np.arccos(dot)
+
+        # 회전 속도 제한 (최대 0.05 rad/step = ~3도/step)
+        max_rot_delta = 0.05
+        angle = np.clip(angle, -max_rot_delta, max_rot_delta)
+
+        # Axis-angle 형태로 반환
+        rot_delta = axis * angle
+
+        return rot_delta
+
     def step_ik(self, pen_result: dict) -> dict:
-        """IK 모드 스텝 (위치 제어)"""
-        # 로봇 상태
-        joint_pos = self.robot.get_joint_positions()
-        joint_vel = self.robot.get_joint_velocities()
-        tcp_pos, tcp_rot = self.robot.get_tcp_pose()
+        """IK 모드 스텝 (스플라인 웨이포인트 수집)"""
+        # 웨이포인트 버퍼 초기화
+        if not hasattr(self, '_spline_waypoints'):
+            self._spline_waypoints = []
+            self._spline_joint_pos = None  # 시뮬레이션용 현재 위치
+            self._spline_step_count = 0    # 스텝 카운터
+            self._total_waypoints = 0      # 총 웨이포인트 수
+
+        # 로봇 상태 (실제 또는 시뮬레이션)
+        if self._spline_joint_pos is None:
+            # 첫 스텝: 실제 로봇 상태 읽기
+            joint_pos = self.robot.get_joint_positions()
+            joint_vel = self.robot.get_joint_velocities()
+            tcp_pos, tcp_rot = self.robot.get_tcp_pose()
+        else:
+            # 시뮬레이션: ROS2 호출 없이 계산
+            joint_pos = self._spline_joint_pos
+            joint_vel = np.zeros(6)  # 시뮬레이션에서는 속도 0
+            tcp_pos, tcp_rot = self.ik.forward_kinematics(joint_pos)
 
         if np.linalg.norm(tcp_pos) < 0.01:
             return {'skip': True}
@@ -412,16 +510,96 @@ class Sim2RealUnified:
         # 거리 계산
         distance_to_cap = np.linalg.norm(cap_pos - grasp_pos)
 
+        # 목표 도달 시 웨이포인트 즉시 실행하고 종료 (5cm 이내)
+        if distance_to_cap < 0.05:
+            print(f"\n  [목표 도달] dist={distance_to_cap*100:.1f}cm - 웨이포인트 실행")
+            if len(self._spline_waypoints) > 0:
+                self.robot.move_spline_joint(
+                    self._spline_waypoints,
+                    vel=self.config.spline_vel,
+                    acc=self.config.spline_acc,
+                    wait=True
+                )
+                print(f"  [완료] 총 {self._total_waypoints}개 웨이포인트")
+                self._spline_waypoints = []
+                self._spline_joint_pos = None
+
+            # 그리퍼 닫기
+            print("  [Gripper] 그리퍼 닫는 중...")
+            self.robot.gripper_close()
+            time.sleep(2.0)  # 그리퍼 닫힐 때까지 대기
+            print("  [Gripper] 완료!")
+
+            # 자동 종료
+            print("\n" + "=" * 60)
+            print("  작업 완료! 프로그램을 종료합니다.")
+            print("=" * 60)
+            self.running = False
+
+            return {
+                'distance_to_cap': distance_to_cap,
+                'success': True,
+                'target_reached': True
+            }
+
         # Action 후처리
         action = self.action_processor.process(raw_action, distance_to_cap)
 
-        # 자동 정지 (2cm 이내)
-        if distance_to_cap < 0.02:
-            action = np.zeros(3)
-
-        # TCP 델타
+        # TCP 위치 델타 (IK용 더 큰 delta 사용)
         tcp_delta = action * self.config.action_scale
-        tcp_delta = np.clip(tcp_delta, -self.config.max_tcp_delta, self.config.max_tcp_delta)
+        tcp_delta = np.clip(tcp_delta, -self.config.max_tcp_delta_ik, self.config.max_tcp_delta_ik)
+
+        # 움직임이 거의 없으면 수렴으로 판단하고 종료
+        if np.linalg.norm(tcp_delta) < 0.0005:  # 0.5mm 미만
+            if not hasattr(self, '_no_move_count'):
+                self._no_move_count = 0
+            self._no_move_count += 1
+
+            if self._no_move_count >= 10:  # 10번 연속 움직임 없음
+                print(f"\n  [수렴] 움직임 없음 (dist={distance_to_cap*100:.1f}cm) - 웨이포인트 실행")
+                if len(self._spline_waypoints) > 0:
+                    self.robot.move_spline_joint(
+                        self._spline_waypoints,
+                        vel=self.config.spline_vel,
+                        acc=self.config.spline_acc,
+                        wait=True
+                    )
+                    print(f"  [완료] 총 {self._total_waypoints}개 웨이포인트")
+                    self._spline_waypoints = []
+                    self._spline_joint_pos = None
+
+                # 그리퍼 닫기
+                print("  [Gripper] 그리퍼 닫는 중...")
+                self.robot.gripper_close()
+                time.sleep(2.0)  # 그리퍼 닫힐 때까지 대기
+                print("  [Gripper] 완료!")
+
+                # 자동 종료
+                print("\n" + "=" * 60)
+                print("  작업 완료! 프로그램을 종료합니다.")
+                print("=" * 60)
+                self.running = False
+                self._no_move_count = 0
+
+                return {
+                    'distance_to_cap': distance_to_cap,
+                    'success': True,
+                    'converged': True
+                }
+        else:
+            self._no_move_count = 0
+
+        # TCP 회전 델타 (펜 방향으로 정렬)
+        # tcp_rot은 이미 위에서 계산됨 (rotation matrix [3,3] 또는 euler)
+        if tcp_rot.shape == (3, 3):
+            tcp_rot_matrix = tcp_rot
+        else:
+            # Euler angles인 경우 변환
+            tcp_rot_matrix = R.from_euler('ZYZ', tcp_rot).as_matrix()
+        # Rotation matrix를 quaternion으로 변환 (scipy: [x,y,z,w] → [w,x,y,z])
+        quat_xyzw = R.from_matrix(tcp_rot_matrix).as_quat()
+        tcp_quat = np.array([quat_xyzw[3], quat_xyzw[0], quat_xyzw[1], quat_xyzw[2]])
+        rot_delta = self._compute_rotation_to_pen(tcp_quat, pen_z)
 
         # 안전 체크
         new_tcp_pos = tcp_pos + tcp_delta
@@ -429,18 +607,72 @@ class Sim2RealUnified:
         if not safe:
             return {'safety_stop': True, 'safety_msg': msg}
 
-        # Jacobian IK
-        delta_q = self.ik.compute(joint_pos, tcp_delta)
-        delta_q = np.clip(delta_q, -np.deg2rad(1.5), np.deg2rad(1.5))
+        # Jacobian IK (위치 + 회전)
+        delta_q = self.ik.compute(joint_pos, tcp_delta, rot_delta)
+        delta_q = np.clip(delta_q, -np.deg2rad(5.0), np.deg2rad(5.0))
 
         new_joint_pos = joint_pos + delta_q
         new_joint_pos = self.robot.clamp_joint_positions(new_joint_pos)
 
-        # 로봇 이동
-        self.robot.move_joint(new_joint_pos, vel=20, acc=20, wait=False)
+        # 스텝 카운터 증가
+        self._spline_step_count += 1
+        self._spline_joint_pos = new_joint_pos.copy()
 
-        # 결과
-        return self._compute_result(action, cap_pos, pen_z, grasp_pos)
+        # 결과 먼저 계산
+        result = self._compute_result(action, cap_pos, pen_z, grasp_pos)
+
+        # 웨이포인트 로깅
+        dist = result.get('distance_to_cap', 1.0)
+        tcp_new, _ = self.ik.forward_kinematics(new_joint_pos)
+        joint_deg = np.degrees(new_joint_pos)
+
+        # N개 중 1개만 저장 (skip 설정)
+        if self._spline_step_count % self.config.spline_skip == 0:
+            self._spline_waypoints.append(new_joint_pos.copy())
+            self._total_waypoints += 1
+
+            # 웨이포인트 로그 출력
+            rot_deg = np.degrees(rot_delta)
+            print(f"\r  [WP {self._total_waypoints:3d}] "
+                  f"dist={dist*100:5.1f}cm | "
+                  f"pos_d={np.linalg.norm(tcp_delta)*1000:4.1f}mm | "
+                  f"rot_d=[{rot_deg[0]:5.2f},{rot_deg[1]:5.2f},{rot_deg[2]:5.2f}]°", end="")
+
+        # 배치가 차면 스플라인 실행
+        if len(self._spline_waypoints) >= self.config.spline_batch_size:
+            print(f"\n  [Spline] {len(self._spline_waypoints)}개 웨이포인트 실행 중...")
+            success = self.robot.move_spline_joint(
+                self._spline_waypoints,
+                vel=self.config.spline_vel,
+                acc=self.config.spline_acc,
+                wait=True
+            )
+            if success:
+                print(f"  [Spline] 완료! (총 {self._total_waypoints}개 계산됨)")
+            else:
+                print(f"  [Spline] 실패")
+            self._spline_waypoints = []
+            self._spline_joint_pos = None  # 실제 로봇 위치로 리셋
+            result['spline_executed'] = True
+
+        return result
+
+    def flush_spline_waypoints(self):
+        """남은 웨이포인트 실행"""
+        total = getattr(self, '_total_waypoints', 0)
+        if hasattr(self, '_spline_waypoints') and len(self._spline_waypoints) > 0:
+            print(f"\n  [Spline] 남은 {len(self._spline_waypoints)}개 웨이포인트 실행...")
+            self.robot.move_spline_joint(
+                self._spline_waypoints,
+                vel=self.config.spline_vel,
+                acc=self.config.spline_acc,
+                wait=True
+            )
+            print(f"  [완료] 총 {total}개 웨이포인트 사용")
+            self._spline_waypoints = []
+            self._spline_joint_pos = None
+        elif total > 0:
+            print(f"\n  [완료] 총 {total}개 웨이포인트 사용")
 
     def step_osc(self, pen_result: dict) -> dict:
         """OSC 모드 스텝 (토크 제어)"""
@@ -493,13 +725,31 @@ class Sim2RealUnified:
         # 위치 델타
         pos_delta = action * self.config.action_scale
         pos_delta = np.clip(pos_delta, -self.config.max_tcp_delta, self.config.max_tcp_delta)
-        rot_delta = np.zeros(3)  # 회전 유지
+
+        # 회전 델타 - 펜 방향에 맞게 그리퍼 정렬
+        rot_delta = self._compute_rotation_to_pen(tcp_quat, pen_z)
+
+        # 디버그 출력 (50스텝마다)
+        if not hasattr(self, '_debug_count'):
+            self._debug_count = 0
+        self._debug_count += 1
+        if self._debug_count % 50 == 0:
+            rot_deg = np.degrees(rot_delta)
+            print(f"[DEBUG] TCP: {tcp_pos*1000}mm, Grasp: {grasp_pos*1000}mm")
+            print(f"[DEBUG] PenCap: {cap_pos*1000}mm, dist: {distance_to_cap*100:.1f}cm")
+            print(f"[DEBUG] pos_delta: {pos_delta*1000}mm, rot_delta: {rot_deg}deg")
 
         # 안전 체크
         new_tcp_pos = tcp_pos + pos_delta
         safe, msg = self._check_safety(new_tcp_pos, cap_pos)
         if not safe:
             return {'safety_stop': True, 'safety_msg': msg}
+
+        # Joint 1 회전 제한 체크
+        if self.config.joint_limits_from_init and hasattr(self, '_init_joint_pos'):
+            joint1_delta = np.degrees(abs(joint_pos[0] - self._init_joint_pos[0]))
+            if joint1_delta > self.config.joint1_max_delta_deg:
+                return {'safety_stop': True, 'safety_msg': f'Joint1 회전 초과: {joint1_delta:.1f}도 (최대 {self.config.joint1_max_delta_deg}도)'}
 
         # OSC 목표 설정
         self.osc.set_target_delta(pos_delta, rot_delta, tcp_pos, tcp_quat)
@@ -517,8 +767,16 @@ class Sim2RealUnified:
             gravity=state.gravity_torque,
         )
 
+        # 토크 클램핑 (충돌 감지 방지, 각 관절 최대 40Nm)
+        max_torque = 40.0
+        torque = np.clip(torque, -max_torque, max_torque)
+
         # 토크 명령 전송
         self.robot.set_torque(torque)
+
+        # 토크 디버그 (50스텝마다)
+        if self._debug_count % 50 == 0:
+            print(f"[DEBUG] torque: {np.round(torque, 2)}")
 
         # 결과
         return self._compute_result(action, cap_pos, pen_z, grasp_pos)
@@ -567,6 +825,20 @@ class Sim2RealUnified:
         """메인 제어 루프"""
         print("\n" + "=" * 60)
         print(f"Sim2Real 대기 모드 [{self.mode.value.upper()}]")
+        print("=" * 60)
+
+        # 시작 시 초기 자세로 이동
+        print("[초기화] 학습 초기 자세로 이동 중...")
+        if self.robot.move_to_home(vel=30, acc=30):
+            print("[초기화] 초기 자세 이동 완료!")
+        else:
+            print("[초기화] 초기 자세 이동 실패 - 수동으로 'h' 키를 눌러주세요")
+
+        # 그리퍼 열기
+        print("[초기화] 그리퍼 열기...")
+        self.robot.gripper_open()
+        time.sleep(1.0)
+
         print("=" * 60)
         print("조작:")
         print("  g: Policy 실행 시작")
@@ -618,6 +890,47 @@ class Sim2RealUnified:
                     if color_image is not None:
                         display = self.detector.visualize(color_image.copy(), result)
 
+                        # 펜 위치/각도 유효성 표시 (로봇 좌표계 기준)
+                        if HAS_WORKSPACE and cap_robot is not None:
+                            y_offset = 150  # 시작 Y 위치
+
+                            # 로봇 좌표계 펜 위치 표시
+                            cv2.putText(display, f"Robot Coord: X={cap_robot[0]*100:.1f} Y={cap_robot[1]*100:.1f} Z={cap_robot[2]*100:.1f} cm",
+                                       (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+
+                            # 위치 유효성 검사
+                            pos_valid, pos_msg = DEFAULT_PEN_WORKSPACE.is_pen_position_valid(
+                                cap_robot[0], cap_robot[1], cap_robot[2])
+
+                            if pos_valid:
+                                cv2.putText(display, "Position: OK (in training range)",
+                                           (10, y_offset + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
+                            else:
+                                cv2.putText(display, f"Position: {pos_msg}",
+                                           (10, y_offset + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1)
+
+                            # 기울기 유효성 검사
+                            if dir_robot is not None:
+                                tilt_rad = calculate_tilt_from_direction(dir_robot)
+                                tilt_deg = np.degrees(tilt_rad)
+                                tilt_valid, tilt_msg = DEFAULT_PEN_WORKSPACE.is_pen_tilt_valid(tilt_rad)
+
+                                if tilt_valid:
+                                    cv2.putText(display, f"Tilt: {tilt_deg:.1f} deg - OK (max 45 deg)",
+                                               (10, y_offset + 40), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
+                                else:
+                                    cv2.putText(display, f"Tilt: {tilt_deg:.1f} deg - {tilt_msg}",
+                                               (10, y_offset + 40), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1)
+
+                            # 전체 유효성 (g 키 누를 수 있는지)
+                            all_valid = pos_valid and (dir_robot is None or tilt_valid)
+                            if all_valid:
+                                cv2.putText(display, ">>> READY TO GRASP (press 'g') <<<",
+                                           (10, y_offset + 65), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                            else:
+                                cv2.putText(display, ">>> MOVE PEN TO VALID RANGE <<<",
+                                           (10, y_offset + 65), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+
                         # 상태 표시
                         mode_str = f"[{self.mode.value.upper()}]"
                         if policy_running:
@@ -630,6 +943,11 @@ class Sim2RealUnified:
 
                         cv2.putText(display, status, (10, display.shape[0] - 10),
                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+                        # 키 안내
+                        key_help = "Keys: g=start h=home s=swap_cap_tip r=reset q=quit"
+                        cv2.putText(display, key_help, (10, display.shape[0] - 35),
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, (180, 180, 180), 1)
 
                         cv2.imshow("Sim2Real", display)
 
@@ -673,6 +991,27 @@ class Sim2RealUnified:
                         self.success_hold_count = 0
                         self.action_processor.reset()
 
+                        # 스플라인 카운터 초기화
+                        self._spline_waypoints = []
+                        self._spline_joint_pos = None
+                        self._spline_step_count = 0
+                        self._total_waypoints = 0
+
+                        # 초기 관절 위치 저장 (관절 제한용)
+                        self._init_joint_pos = self.robot.get_joint_positions().copy()
+                        print(f"  초기 Joint1: {np.degrees(self._init_joint_pos[0]):.1f}도")
+                        print(f"  스플라인: batch={self.config.spline_batch_size}, skip={self.config.spline_skip}")
+                elif key == ord('s'):
+                    # Cap/Tip swap
+                    if self.detector is not None:
+                        self.detector.swap_cap_tip()
+                        print("[Swap] Cap/Tip 위치 교환됨")
+                elif key == ord('r'):
+                    # Tracking reset
+                    if self.detector is not None:
+                        self.detector.reset_tracking()
+                        print("[Reset] 트래킹 리셋")
+
                 # Policy 실행
                 if policy_running and fixed_pen_result is not None:
                     if reached_target:
@@ -688,6 +1027,7 @@ class Sim2RealUnified:
 
                         if info.get('safety_stop'):
                             print(f"\n[안전 정지] {info.get('safety_msg')}")
+                            self.flush_spline_waypoints()  # 남은 웨이포인트 실행
                             policy_running = False
                             fixed_pen_result = None
                             if rt_started:
@@ -705,6 +1045,7 @@ class Sim2RealUnified:
 
                         if info.get('success'):
                             print(f"\n\n[성공!] {self.config.success_hold_steps} 스텝 유지")
+                            self.flush_spline_waypoints()  # 남은 웨이포인트 실행
                             policy_running = False
                             fixed_pen_result = None
 
@@ -715,6 +1056,7 @@ class Sim2RealUnified:
                     elapsed = time.time() - start_time
                     if elapsed > self.config.max_duration:
                         print(f"\n[시간 초과] {self.config.max_duration}초")
+                        self.flush_spline_waypoints()  # 남은 웨이포인트 실행
                         policy_running = False
                         fixed_pen_result = None
 
@@ -727,6 +1069,9 @@ class Sim2RealUnified:
             print("\n\n[중단됨]")
 
         finally:
+            # IK 모드: 남은 웨이포인트 실행
+            self.flush_spline_waypoints()
+
             # OSC 모드: 실시간 제어 종료
             if rt_started:
                 self.robot.stop_rt_control()
@@ -761,18 +1106,24 @@ def main():
     parser.add_argument("--yolo_model", type=str,
                         default="/home/fhekwn549/runs/segment/train/weights/best.pt",
                         help="YOLO 모델 경로")
-    parser.add_argument("--duration", type=float, default=60.0,
-                        help="최대 실행 시간 (초)")
+    parser.add_argument("--duration", type=float, default=0.0,
+                        help="최대 실행 시간 (초), 0=무제한")
+    parser.add_argument("--spline-batch", type=int, default=50,
+                        help="스플라인 웨이포인트 배치 크기 (최대 100)")
+    parser.add_argument("--spline-skip", type=int, default=1,
+                        help="웨이포인트 건너뛰기 (1=전부, 2=절반, 3=1/3만 저장)")
     parser.add_argument("--freq-ik", type=float, default=10.0,
                         help="IK 모드 제어 주파수 (Hz)")
-    parser.add_argument("--freq-osc", type=float, default=100.0,
-                        help="OSC 모드 제어 주파수 (Hz)")
-    parser.add_argument("--osc-stiffness", type=float, default=150.0,
-                        help="OSC 강성")
+    parser.add_argument("--freq-osc", type=float, default=30.0,
+                        help="OSC 모드 제어 주파수 (Hz), 낮을수록 느림")
+    parser.add_argument("--osc-stiffness-pos", type=float, default=200.0,
+                        help="OSC 위치 강성 (200 권장, 높으면 충돌감지)")
+    parser.add_argument("--osc-stiffness-rot", type=float, default=100.0,
+                        help="OSC 회전 강성 (100 권장)")
     parser.add_argument("--osc-damping", type=float, default=1.0,
                         help="OSC 댐핑 비율")
-    parser.add_argument("--gripper-offset", type=float, default=0.08,
-                        help="그리퍼 오프셋 (미터)")
+    parser.add_argument("--gripper-offset", type=float, default=0.07,
+                        help="그리퍼 오프셋 (미터), TCP에서 그립 포인트까지 거리")
     parser.add_argument("--no-safety", action="store_true",
                         help="안전 체크 비활성화")
 
@@ -784,10 +1135,13 @@ def main():
         checkpoint_path=args.checkpoint,
         calibration_path=args.calibration,
         yolo_model_path=args.yolo_model,
-        max_duration=args.duration,
+        max_duration=args.duration if args.duration > 0 else float('inf'),
+        spline_batch_size=min(args.spline_batch, 100),  # 최대 100
+        spline_skip=max(args.spline_skip, 1),  # 최소 1
         control_freq_ik=args.freq_ik,
         control_freq_osc=args.freq_osc,
-        osc_stiffness=args.osc_stiffness,
+        osc_stiffness_pos=args.osc_stiffness_pos,
+        osc_stiffness_rot=args.osc_stiffness_rot,
         osc_damping_ratio=args.osc_damping,
         gripper_offset_z=args.gripper_offset,
         disable_safety=args.no_safety,
