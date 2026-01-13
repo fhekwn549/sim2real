@@ -1183,9 +1183,9 @@ def main():
         controller.run()
     finally:
         controller.shutdown()
-        # 명시적 종료 (OpenCV 쓰레드 정리)
-        import sys
-        sys.exit(0)
+        # 강제 종료 (OpenCV C++ 쓰레드 문제 우회)
+        import os
+        os._exit(0)
 
 
 if __name__ == "__main__":
