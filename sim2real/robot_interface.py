@@ -282,41 +282,48 @@ class DoosanRobot:
         """그리퍼 위치 설정 (0=열림, 700=닫힘)"""
         return self._gripper_command(f"pos {position}")
 
-    def _gripper_command(self, cmd: str) -> bool:
-        """그리퍼 명령 실행 (ROS2 Trigger 서비스 사용)"""
+    def _gripper_command(self, cmd: str, max_retries: int = 3) -> bool:
+        """그리퍼 명령 실행 (ROS2 Trigger 서비스 사용, 재시도 포함)"""
         if self.simulation:
             print(f"[Gripper] (시뮬레이션) {cmd}")
             return True
 
         import subprocess
+        import time
 
-        try:
-            # /dsr01/gripper/open, /dsr01/gripper/close 서비스 사용
-            # gripper_service_node.py가 실행 중이어야 함
-            if cmd == "open":
-                service_cmd = f"ros2 service call /dsr01/gripper/open std_srvs/srv/Trigger"
-            elif cmd == "close":
-                service_cmd = f"ros2 service call /dsr01/gripper/close std_srvs/srv/Trigger"
-            else:
-                print(f"[Gripper] 알 수 없는 명령: {cmd}")
-                return False
-
-            print(f"[Gripper] {cmd} 명령 실행 중...")
-            result = subprocess.run(service_cmd, shell=True, capture_output=True, text=True, timeout=15)
-
-            if "success=True" in result.stdout or "success: true" in result.stdout.lower():
-                print(f"[Gripper] {cmd} 완료")
-                return True
-            else:
-                print(f"[Gripper] {cmd} 실패: {result.stdout[:200]}")
-                return False
-
-        except subprocess.TimeoutExpired:
-            print(f"[Gripper] {cmd} 타임아웃")
+        # /dsr01/gripper/open, /dsr01/gripper/close 서비스 사용
+        # gripper_service_node.py가 실행 중이어야 함
+        if cmd == "open":
+            service_cmd = f"ros2 service call /dsr01/gripper/open std_srvs/srv/Trigger"
+        elif cmd == "close":
+            service_cmd = f"ros2 service call /dsr01/gripper/close std_srvs/srv/Trigger"
+        else:
+            print(f"[Gripper] 알 수 없는 명령: {cmd}")
             return False
-        except Exception as e:
-            print(f"[Gripper] {cmd} 오류: {e}")
-            return False
+
+        for attempt in range(max_retries):
+            try:
+                if attempt > 0:
+                    print(f"[Gripper] {cmd} 재시도 ({attempt + 1}/{max_retries})...")
+                    time.sleep(0.5)  # 재시도 전 대기
+                else:
+                    print(f"[Gripper] {cmd} 명령 실행 중...")
+
+                result = subprocess.run(service_cmd, shell=True, capture_output=True, text=True, timeout=15)
+
+                if "success=True" in result.stdout or "success: true" in result.stdout.lower():
+                    print(f"[Gripper] {cmd} 완료")
+                    return True
+                else:
+                    print(f"[Gripper] {cmd} 실패 (시도 {attempt + 1}): {result.stdout[:100]}")
+
+            except subprocess.TimeoutExpired:
+                print(f"[Gripper] {cmd} 타임아웃 (시도 {attempt + 1})")
+            except Exception as e:
+                print(f"[Gripper] {cmd} 오류 (시도 {attempt + 1}): {e}")
+
+        print(f"[Gripper] {cmd} 최종 실패 ({max_retries}회 시도)")
+        return False
 
     def get_joint_positions(self) -> np.ndarray:
         """

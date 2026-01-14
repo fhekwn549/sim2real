@@ -527,10 +527,14 @@ class Sim2RealUnified:
                 self._spline_waypoints = []
                 self._spline_joint_pos = None
 
-            # 그리퍼 닫기
+            # 그리퍼 닫기 (확실하게 닫히도록 2회 시도)
             print("  [Gripper] 그리퍼 닫는 중...")
-            self.robot.gripper_close()
-            time.sleep(2.0)  # 그리퍼 닫힐 때까지 대기
+            success = self.robot.gripper_close()
+            time.sleep(1.5)
+            if not success:
+                print("  [Gripper] 첫 번째 시도 실패, 재시도...")
+                self.robot.gripper_close()
+                time.sleep(1.5)
             print("  [Gripper] 완료!")
 
             # 자동 종료
@@ -571,10 +575,14 @@ class Sim2RealUnified:
                     self._spline_waypoints = []
                     self._spline_joint_pos = None
 
-                # 그리퍼 닫기
+                # 그리퍼 닫기 (확실하게 닫히도록 2회 시도)
                 print("  [Gripper] 그리퍼 닫는 중...")
-                self.robot.gripper_close()
-                time.sleep(2.0)  # 그리퍼 닫힐 때까지 대기
+                success = self.robot.gripper_close()
+                time.sleep(1.5)
+                if not success:
+                    print("  [Gripper] 첫 번째 시도 실패, 재시도...")
+                    self.robot.gripper_close()
+                    time.sleep(1.5)
                 print("  [Gripper] 완료!")
 
                 # 자동 종료
