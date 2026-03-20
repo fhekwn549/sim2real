@@ -55,7 +55,7 @@ class CalibrationConfig:
     # ArUco 마커
     marker_id: int = 0                    # 사용할 마커 ID
     marker_size: float = 0.05             # 마커 크기 (미터)
-    aruco_dict_type: int = aruco.DICT_6X6_250 if ARUCO_AVAILABLE else 0
+    aruco_dict_type: int = aruco.DICT_6X6_50 if ARUCO_AVAILABLE else 0
 
     # 데이터 수집
     min_samples: int = 3                  # 최소 샘플 수 (simple 방식은 3개면 충분)
@@ -105,6 +105,11 @@ class ArucoDetector:
                 self.aruco_dict = aruco.getPredefinedDictionary(dict_type)
                 self.detector = aruco.ArucoDetector(self.aruco_dict, self.aruco_params)
                 self.detectors = None
+                # 이름 설정
+                for dtype, name in self.DICT_TYPES:
+                    if dtype == dict_type:
+                        self.detected_dict_name = name
+                        break
             else:
                 # 여러 딕셔너리 준비
                 self.detector = None
@@ -219,8 +224,8 @@ class EyeToHandCalibrator:
         # ArUco (자동 딕셔너리 탐지)
         self.aruco_detector = ArucoDetector(
             self.config.marker_size,
-            dict_type=None,  # 자동 탐지
-            auto_detect=True
+            dict_type=self.config.aruco_dict_type,
+            auto_detect=False
         )
 
         # 로봇
@@ -250,6 +255,11 @@ class EyeToHandCalibrator:
                 rs.stream.color,
                 self.config.camera_width, self.config.camera_height,
                 rs.format.bgr8, self.config.camera_fps
+            )
+            config.enable_stream(
+                rs.stream.depth,
+                self.config.camera_width, self.config.camera_height,
+                rs.format.z16, self.config.camera_fps
             )
 
             profile = self.pipeline.start(config)
@@ -293,22 +303,59 @@ class EyeToHandCalibrator:
             self.robot.disconnect()
 
     def get_frame(self) -> Optional[np.ndarray]:
-        """카메라 프레임 가져오기"""
+        """카메라 프레임 가져오기 (color only, 호환용)"""
+        result = self.get_frame_with_depth()
+        if result is None:
+            return None
+        return result[0]
+
+    def get_frame_with_depth(self) -> Optional[Tuple[np.ndarray, any]]:
+        """카메라 color + depth 프레임 가져오기"""
         if self.pipeline is None:
             return None
 
         try:
             frames = self.pipeline.wait_for_frames(timeout_ms=1000)
-            color_frame = frames.get_color_frame()
+            aligned = self.align.process(frames)
+            color_frame = aligned.get_color_frame()
+            depth_frame = aligned.get_depth_frame()
 
             if not color_frame:
                 return None
 
-            return np.asanyarray(color_frame.get_data())
+            color_image = np.asanyarray(color_frame.get_data())
+            return color_image, depth_frame
 
         except Exception as e:
             print(f"[Calibrator] Get frame failed: {e}")
             return None
+
+    def pixel_to_3d(self, u: float, v: float, depth_frame) -> Optional[np.ndarray]:
+        """픽셀 좌표 + depth → 카메라 3D 좌표 (미터)"""
+        if depth_frame is None:
+            return None
+
+        depth_m = depth_frame.get_distance(int(u), int(v))
+        if depth_m <= 0 or depth_m > 5.0:
+            # 주변 픽셀에서 depth 탐색
+            for du in range(-5, 6):
+                for dv in range(-5, 6):
+                    pu, pv = int(u) + du, int(v) + dv
+                    if 0 <= pu < self.config.camera_width and 0 <= pv < self.config.camera_height:
+                        d = depth_frame.get_distance(pu, pv)
+                        if 0.1 < d < 5.0:
+                            depth_m = d
+                            break
+                if depth_m > 0 and depth_m < 5.0:
+                    break
+
+        if depth_m <= 0 or depth_m > 5.0:
+            return None
+
+        # Deproject pixel to 3D point
+        intrinsics = depth_frame.profile.as_video_stream_profile().intrinsics
+        point_3d = rs.rs2_deproject_pixel_to_point(intrinsics, [u, v], depth_m)
+        return np.array(point_3d)
 
     def detect_marker(self, image: np.ndarray) -> Optional[Tuple[np.ndarray, np.ndarray]]:
         """마커 감지"""
@@ -322,85 +369,117 @@ class EyeToHandCalibrator:
 
     def capture_sample(self) -> bool:
         """
-        현재 자세에서 샘플 캡처
+        현재 자세에서 샘플 캡처 (depth 센서 기반)
 
         Returns:
             성공 여부
         """
-        # 카메라에서 마커 감지
-        image = self.get_frame()
-        if image is None:
+        # 카메라에서 color + depth 가져오기
+        frame_result = self.get_frame_with_depth()
+        if frame_result is None:
             print("[Calibrator] Failed to get camera frame")
             return False
 
+        image, depth_frame = frame_result
+
+        # 마커 감지 (color 이미지에서 2D 위치)
         result = self.detect_marker(image)
         if result is None:
             print("[Calibrator] Marker not detected")
             return False
 
         rvec, tvec = result
-
-        # 마커 pose (카메라 좌표계)
         R_marker, _ = cv2.Rodrigues(rvec)
-        t_marker = tvec.flatten()
 
-        # 로봇 TCP pose (로봇 베이스 좌표계) - 정확한 값 필요
-        print("[Calibrator] TCP 읽는 중... (로봇이 정지한 상태여야 합니다)")
+        # depth 센서로 마커 중심의 3D 좌표 계산
+        corners, ids, _ = self.aruco_detector.detector.detectMarkers(image) if self.aruco_detector.detector else (None, None, None)
+        if ids is None:
+            # fallback: detectors 사용
+            for det, name in (self.aruco_detector.detectors or []):
+                corners, ids, _ = det.detectMarkers(image)
+                if ids is not None:
+                    break
+
+        if ids is None or self.config.marker_id not in ids.flatten():
+            print("[Calibrator] Marker corners not found")
+            return False
+
+        idx = list(ids.flatten()).index(self.config.marker_id)
+        center = corners[idx][0].mean(axis=0)  # 마커 중심 픽셀
+
+        # depth 기반 3D 좌표
+        t_marker_depth = self.pixel_to_3d(center[0], center[1], depth_frame)
+
+        if t_marker_depth is not None:
+            t_marker = t_marker_depth
+            method = "depth"
+        else:
+            t_marker = tvec.flatten()
+            method = "solvePnP (depth unavailable)"
+            print("[Calibrator] Warning: depth 데이터 없음, solvePnP fallback")
+
+        # 로봇 TCP pose
+        print(f"[Calibrator] TCP 읽는 중... (method: {method})")
         tcp_pos, tcp_rot = self.robot.get_tcp_pose_accurate()
+        self._tcp_display_cache = tcp_pos.copy()
 
-        # 저장 (기존 방식 호환)
+        # 저장
         self.marker_poses.append((R_marker, t_marker))
         self.robot_poses.append((tcp_rot, tcp_pos))
-
-        # simple 방식용 위치 저장
         self.cam_positions.append(t_marker.copy())
         self.robot_positions.append(tcp_pos.copy())
 
-        # 축 변환 후 오프셋 미리 보기
-        R_axes = self.get_axes_rotation_matrix()
-        cam_transformed = R_axes @ t_marker
-        offset = tcp_pos - cam_transformed
-
-        print(f"\n[Sample #{len(self.robot_positions)}]")
+        print(f"\n[Sample #{len(self.robot_positions)}] ({method})")
         print(f"  Camera: [{t_marker[0]*100:+6.2f}, {t_marker[1]*100:+6.2f}, {t_marker[2]*100:+6.2f}] cm")
         print(f"  Robot:  [{tcp_pos[0]*100:+6.2f}, {tcp_pos[1]*100:+6.2f}, {tcp_pos[2]*100:+6.2f}] cm")
-        print(f"  Offset: [{offset[0]*100:+6.2f}, {offset[1]*100:+6.2f}, {offset[2]*100:+6.2f}] cm")
 
         return True
 
     def calibrate(self) -> bool:
         """
-        캘리브레이션 수행 (Simple 방식 - 오프셋 계산)
+        캘리브레이션 수행 (SVD 기반 - R과 t 모두 자동 계산)
 
         원리:
-            축 변환은 이미 측정됨 (Robot X=Cam Y, Robot Y=Cam X, Robot Z=-Cam Z)
-            위치 오프셋만 계산하면 됨
-
-            P_robot = R_axes @ P_cam + t_offset
-            t_offset = mean(P_robot_tcp - R_axes @ P_cam_marker)
+            P_robot = R @ P_cam + t
+            SVD를 사용해 최적의 R, t를 구함 (Procrustes 분석)
         """
         if len(self.cam_positions) < self.config.min_samples:
             print(f"[Calibrator] Not enough samples: {len(self.cam_positions)} < {self.config.min_samples}")
             return False
 
-        print(f"\n[Calibrator] Simple 방식으로 캘리브레이션 ({len(self.cam_positions)}개 샘플)...")
+        print(f"\n[Calibrator] SVD 방식으로 캘리브레이션 ({len(self.cam_positions)}개 샘플)...")
 
-        # 축 변환 행렬
-        R_axes = self.get_axes_rotation_matrix()
+        # SVD로 최적 R, t 계산
+        cam_pts = np.array(self.cam_positions)
+        robot_pts = np.array(self.robot_positions)
 
-        # 각 샘플에서 오프셋 계산
+        cam_center = cam_pts.mean(axis=0)
+        robot_center = robot_pts.mean(axis=0)
+
+        cam_centered = cam_pts - cam_center
+        robot_centered = robot_pts - robot_center
+
+        H = cam_centered.T @ robot_centered
+        U, S, Vt = np.linalg.svd(H)
+        R_axes = Vt.T @ U.T
+
+        # Reflection correction
+        if np.linalg.det(R_axes) < 0:
+            Vt[-1, :] *= -1
+            R_axes = Vt.T @ U.T
+
+        t_offset = robot_center - R_axes @ cam_center
+
+        self._computed_R_axes = R_axes
+        self.t_offset = t_offset
+
+        # 각 샘플별 오프셋 편차 (일관성 확인)
         offsets = []
         for cam_pos, robot_pos in zip(self.cam_positions, self.robot_positions):
-            cam_transformed = R_axes @ cam_pos
-            offset = robot_pos - cam_transformed
-            offsets.append(offset)
+            predicted = R_axes @ cam_pos + t_offset
+            offsets.append(robot_pos - predicted)
 
         offsets = np.array(offsets)
-
-        # 평균 오프셋
-        self.t_offset = np.mean(offsets, axis=0)
-
-        # 표준편차 (일관성 확인)
         std = np.std(offsets, axis=0)
 
         print(f"\n[Result]")
@@ -517,7 +596,7 @@ class EyeToHandCalibrator:
         # 디렉토리 생성
         os.makedirs(os.path.dirname(path), exist_ok=True)
 
-        R_axes = self.get_axes_rotation_matrix()
+        R_axes = self._computed_R_axes if hasattr(self, '_computed_R_axes') else self.get_axes_rotation_matrix()
 
         np.savez(
             path,
@@ -613,7 +692,7 @@ class EyeToHandCalibrator:
             print("[Calibrator] No calibration loaded")
             return point_cam
 
-        R_axes = self.get_axes_rotation_matrix()
+        R_axes = self._computed_R_axes if hasattr(self, '_computed_R_axes') else self.get_axes_rotation_matrix()
         return R_axes @ point_cam + self.t_offset
 
     @staticmethod
@@ -750,9 +829,9 @@ class EyeToHandCalibrator:
             cv2.putText(display, f"Samples: {len(self.cam_positions)}/{self.config.min_samples}",
                        (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, status_color, 2)
 
-            # 로봇 TCP 위치 표시
-            if self.robot and self.robot.connected:
-                tcp_pos, _ = self.robot.get_tcp_pose()
+            # 로봇 TCP 위치 표시 (캡처 시에만 읽음 — subprocess 호출이 느려서 화면에는 캐시만 표시)
+            if self.robot and self.robot.connected and hasattr(self, '_tcp_display_cache'):
+                tcp_pos = self._tcp_display_cache
                 cv2.putText(display, f"TCP: [{tcp_pos[0]:.3f}, {tcp_pos[1]:.3f}, {tcp_pos[2]:.3f}]",
                            (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
 
